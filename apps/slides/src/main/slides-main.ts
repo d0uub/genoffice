@@ -13,11 +13,12 @@ import {
   ipcMain,
   Menu,
   nativeImage,
+  nativeTheme,
   session as electronSession,
   shell,
   WebContentsView,
 } from 'electron'
-import type { WebContents } from 'electron'
+import type { WebContents, UiTheme } from 'electron'
 import { execFile } from 'node:child_process'
 import { readFile, writeFile, rm, stat, mkdir, open } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
@@ -926,6 +927,13 @@ function chartColorSchemes(
 
 let ipcRegistered = false
 
+// Theme state (mirrors shell/app behavior for standalone slides mode)
+let cachedTheme: UiTheme | null = null
+
+function currentTheme(): UiTheme {
+  return cachedTheme ?? 'system'
+}
+
 export function registerSlidesIpc(): void {
   if (ipcRegistered) return
   ipcRegistered = true
@@ -933,6 +941,19 @@ export function registerSlidesIpc(): void {
   // shared with the other editor modules — last (identical) registration wins
   ipcMain.removeHandler('app:get-language')
   ipcMain.handle('app:get-language', () => getUiLang())
+
+  // Theme handling (for standalone slides mode without shell)
+  ipcMain.removeHandler('app:get-theme')
+  ipcMain.handle('app:get-theme', (): UiTheme => currentTheme())
+
+  ipcMain.removeHandler('app:set-theme')
+  ipcMain.handle('app:set-theme', (_event, theme: unknown) => {
+    if (theme !== 'light' && theme !== 'dark' && theme !== 'system') return
+    if (theme === currentTheme()) return
+    cachedTheme = theme
+    nativeTheme.themeSource = theme
+    for (const wc of BrowserWindow.getAllWebContents()) wc.send('app:theme-changed', theme)
+  })
 
   // Screen recording: source dispatch for the renderer's navigator.mediaDevices.getDisplayMedia.
   // macOS prefers the system picker (with its permission flow), falling back to the first screen.

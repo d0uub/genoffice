@@ -281,6 +281,7 @@ const api: SlidesApi = {
   aiGskLogin: () => ipcRenderer.invoke('ai:gsk-login'),
   webSearch: (query: string, maxResults?: number) =>
     ipcRenderer.invoke('ai:web-search', query, maxResults),
+  webFetch: (url: string) => ipcRenderer.invoke('ai:web-fetch', url),
   imageSearch: (query: string, maxResults?: number) =>
     ipcRenderer.invoke('ai:image-search', query, maxResults),
   insertImageUrl: (op: {

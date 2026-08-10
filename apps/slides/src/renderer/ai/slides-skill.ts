@@ -266,6 +266,7 @@ Native tools (only for modifying/refining existing pages, not for generating fro
 
 Search and images:
 - Use web_search when you need current information/data/fact-checking; search before writing anything uncertain, don't fabricate. When generating a whole deck, a round of searching for real material first is recommended.
+- Use web_fetch when the user provides a specific URL (starts with http:// or https://) or says "fetch this page/link". **web_fetch retrieves the full page content as markdown; web_search only finds links. When in doubt and a URL is provided, use web_fetch.**
 - **Figure provenance is enforced at the tool layer**: add_chart / edit_chart (with series) and data-dense generate_deck / regenerate_slide briefs refuse to run without a dataSource declaration; 'search' is only accepted after an actual web_search in this conversation. Fabricating precise numbers (¥21.8-style precision) and delivering them as fact is the worst failure mode — when no real data is available, use dataSource:'sample' and tell the user explicitly that the figures are illustrative.
 - image_search for images (English keywords) → get imageUrl. **Two usages**: 1) when redoing a page via regenerate_slide, pass the imageUrl in image_urls; 2) when adding an image to an existing page, use insert_web_image to insert at a position. (generate_deck searches images internally; no advance search needed for a whole new deck.)
 - Travel, product, people, and brand decks get images by default without the user asking; mind whitespace between images and text, no overlap.
@@ -1144,6 +1145,18 @@ const TOOLS: AgentToolDef[] = [
         sourceId: { type: 'string', description: 'Group element id' },
       },
       required: ['slideIndex', 'sourceId'],
+    },
+  },
+  {
+    name: 'web_fetch',
+    description:
+      'Fetch a web page and convert to markdown. Use when you need the full content of a specific URL (articles/docs/tutorials). Returns markdown content and page title.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'URL to fetch' },
+      },
+      required: ['url'],
     },
   },
 ]
@@ -2040,6 +2053,34 @@ async function executeTool(
         mutated: false,
         summary: t('aiSumImageSearch', { query, count: r.images.length }),
         display,
+      }
+    }
+
+    case 'web_fetch': {
+      const url = String(call.input.url ?? '').trim()
+      if (!url) return fail(t('aiFailWebFetch'), 'url must not be empty')
+      const r = await window.slidesApi.webFetch(url)
+      if (r.method === 'error') {
+        return fail(
+          t('aiFailWebFetch'),
+          `web fetch failed (service error — you may retry): ${r.error ?? 'unknown error'}`,
+        )
+      }
+      const content = String(r.content || '')
+      if (!content) {
+        return fail(
+          t('aiFailWebFetch'),
+          `web fetch returned empty content (status: ${r.method})`,
+        )
+      }
+      const lines: string[] = []
+      if (r.title) lines.push(`Title: ${r.title}\n`)
+      lines.push(`URL: ${url}\n`)
+      lines.push(`Content:\n${content}`)
+      return {
+        output: lines.join('\n'),
+        mutated: false,
+        summary: t('aiSumWebFetchDone', { url }),
       }
     }
 

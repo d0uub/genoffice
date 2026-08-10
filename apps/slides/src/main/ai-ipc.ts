@@ -23,6 +23,7 @@ import { fetchRemoteImage } from '@genoffice/electron-utils'
 import {
   webSearch,
   imageSearch,
+  webFetch,
   ensureGenofficeLogin,
   gskApiKey,
   gskGenerateImage,
@@ -164,6 +165,14 @@ export function registerAiIpc(): void {
       return await imageSearch(String(query), typeof maxResults === 'number' ? maxResults : 8)
     } catch (err) {
       return { images: [], method: 'error', error: String(err) }
+    }
+  })
+
+  ipcMain.handle('ai:web-fetch', async (_event, url: string) => {
+    try {
+      return await webFetch(String(url))
+    } catch (err) {
+      return { content: '', method: 'error', error: String(err) }
     }
   })
 }

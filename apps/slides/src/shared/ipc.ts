@@ -1326,6 +1326,9 @@ export interface SlidesApi {
     answer?: string
     method: string
   }>
+  webFetch: (
+    url: string,
+  ) => Promise<{ content: string; title?: string; method: string; error?: string }>
   imageSearch: (
     query: string,
     maxResults?: number,
