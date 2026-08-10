@@ -292,6 +292,16 @@ const desktopApi: DesktopApi = {
     }
     return result as unknown as WebSearchResult
   },
+  async webFetch(url) {
+    if (typeof url !== 'string' || !url.trim()) {
+      throw new Error('Invalid URL.')
+    }
+    const result: unknown = await ipcRenderer.invoke('ai:web-fetch', url)
+    if (!isRecord(result) || typeof result.method !== 'string') {
+      throw new Error('Invalid web fetch response.')
+    }
+    return result as { content: string; title?: string; method: string; error?: string }
+  },
   onAiStream(callback) {
     const listener = (_event: unknown, chunk: unknown): void => {
       if (

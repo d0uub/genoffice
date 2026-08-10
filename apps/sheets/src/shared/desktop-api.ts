@@ -1966,6 +1966,8 @@ export interface DesktopApi {
   aiGskLogin(): Promise<void>
   /// Web search (main-process Serper/DuckDuckGo, shared with docs/slides)
   webSearch(query: string, maxResults?: number): Promise<WebSearchResult>
+  /// Web fetch - fetch a URL and convert to markdown (shared with docs/slides)
+  webFetch(url: string): Promise<{ content: string; title?: string; method: string; error?: string }>
   onAiStream(handler: (chunk: AiStreamChunk) => void): () => void
   /// Chat attachments: multi-select file dialog (returns null on cancel)
   pickAttachments(): Promise<AttachmentAddResult | null>

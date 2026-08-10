@@ -70,6 +70,7 @@ import {
   setGskProxyUrl,
   webSearch,
   imageSearch,
+  webFetch,
 } from '@genoffice/ai-search'
 import { parseFileToText } from '@genoffice/file-parse'
 import type { CellEdit, SheetStructuralOps } from '../gateway/xlsx-gateway'
@@ -2247,6 +2248,19 @@ export function registerSheetsAiIpc(): void {
       )
     } catch (err) {
       return { images: [], method: 'error', error: String(err) }
+    }
+  })
+  ipcMain.handle('ai:web-fetch', async (_event, url: unknown) => {
+    try {
+      const result = await webFetch(z.string().parse(url))
+      return {
+        content: String(result.content),
+        title: result.title || undefined,
+        method: result.method,
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      return { content: '', method: 'error', error: errorMsg }
     }
   })
 }

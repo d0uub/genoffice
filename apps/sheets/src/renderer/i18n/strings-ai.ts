@@ -173,6 +173,9 @@ export const aiStrings = defineStrings({
     aiToolReadFile: 'Read {name}',
     aiToolWebSearch: 'Web search',
     aiToolWebSearchDone: 'Searched "{query}" ({count} results)',
+    aiToolWebFetch: 'Web fetch',
+    aiSumWebFetch: 'Fetch web page',
+    aiSumWebFetchDone: 'Fetched {url}',
   },
   ja: {
     aiComposerPlaceholderBuild: '作りたい表・データ・グラフを入力…',
