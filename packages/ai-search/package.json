@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@genspark/cli": "^1.4.2",
+    "cheerio": "^1.2.0",
     "turndown": "^7.0.0"
   },
   "devDependencies": {
