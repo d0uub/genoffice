@@ -480,10 +480,26 @@ export function AiPanel({
         onText: (text) => patchLastAssistant({ text }),
         onToolStart: (call) => {
           // Live "running" chip: replaced in place by onToolExecuted
+          const toolName = call?.name || 'unknown'
+          console.log('[AiPanel] onToolStart DEBUG:', { 
+            callExists: !!call, 
+            callName: call?.name, 
+            toolNameType: typeof toolName,
+            toolNameValue: toolName,
+            isString: typeof toolName === 'string'
+          })
+          let summary: string
+          if (typeof toolName === 'string') {
+            summary = toolName.replace(/[_-]+/g, ' ')
+          } else {
+            console.error('[AiPanel] toolName is not a string!', toolName)
+            summary = 'Tool execution'
+          }
+          console.log('[AiPanel] onToolStart:', { call, toolName, summary })
           patchLastAssistant((last) => ({
             tools: [
               ...(last.tools ?? []),
-              { name: call.name, summary: call.name.replace(/[_-]+/g, ' '), running: true },
+              { name: toolName, summary, running: true },
             ],
           }))
         },
@@ -505,9 +521,11 @@ export function AiPanel({
             // tracking on: revisions stay pending, handled in the Review tab
             if (!trackChangesRef.current) clearAiHighlights(true)
           }
+          const summaryText = typeof execution.summary === 'string' ? execution.summary : String(execution.summary || '')
+          console.log('[AiPanel] onToolExecuted:', { callName: call.name, executionSummary: execution.summary, summaryText })
           runToolsRef.current.push({
             name: call.name,
-            summary: execution.summary,
+            summary: summaryText,
             isError: execution.isError,
             input: safeJsonInput(call.input),
             output: execution.output
@@ -523,7 +541,7 @@ export function AiPanel({
                 ...tools,
                 {
                   name: call.name,
-                  summary: execution.summary,
+                  summary: summaryText,
                   isError: execution.isError,
                   output: execution.output
                     ? execution.output.slice(0, TOOL_OUTPUT_MAX_CHARS)

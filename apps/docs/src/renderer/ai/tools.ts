@@ -123,8 +123,18 @@ export const AGENT_TOOLS: AgentToolDef[] = [
       },
       required: ['query'],
     },
-  },
-  {
+  },  {
+    name: 'web_fetch',
+    description:
+      'Fetch a web page and convert to markdown. Use when you need the full content of a specific URL (articles/docs/tutorials). Returns markdown content and page title.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: 'URL to fetch' },
+      },
+      required: ['url'],
+    },
+  },  {
     name: 'insert_image',
     description:
       'Download a direct image link (an imageUrl from image_search) and insert it into the document (at the cursor / end of document).',
@@ -324,13 +334,43 @@ async function executeAsyncTool(
         )
       }
       const lines = r.images.map(
-        (im, i) =>
-          `${i + 1}. ${im.title || '(untitled)'} [${im.width ?? '?'}x${im.height ?? '?'}]\n   ${im.imageUrl}`,
+        (it, i) => `${i + 1}. ${it.title}\n   ${it.imageUrl}\n   source: ${it.sourceUrl || it.source}`,
       )
       return {
         output: lines.join('\n') || '(no images)',
         mutated: false,
         summary: t('aiSumImageSearchDone', { query, count: r.images.length }),
+      }
+    }
+    case 'web_fetch': {
+      const url = String(call.input.url ?? '').trim()
+      if (!url) return fail(t('aiSumWebFetch'), 'url must not be empty')
+      console.log('[tools.ts] web_fetch calling window.desktop.webFetch with URL:', url)
+      const r = await window.desktop.webFetch(url)
+      console.log('[tools.ts] web_fetch result:', { method: r.method, error: r.error, contentLength: r.content?.length, title: r.title })
+      if (r.method === 'error') {
+        console.log('[tools.ts] web_fetch ERROR:', r.error)
+        return fail(
+          t('aiSumWebFetch'),
+          `web fetch failed (service error — you may retry): ${r.error ?? 'unknown error'}`,
+        )
+      }
+      // Defensive: ensure content exists and is a string
+      const content = String(r.content || '')
+      if (!content) {
+        return fail(
+          t('aiSumWebFetch'),
+          `web fetch returned empty content (status: ${r.method})`,
+        )
+      }
+      const lines: string[] = []
+      if (r.title) lines.push(`Title: ${r.title}\n`)
+      lines.push(`URL: ${url}\n`)
+      lines.push(`Content:\n${content}`)
+      return {
+        output: lines.join('\n'),
+        mutated: false,
+        summary: t('aiSumWebFetchDone', { url }),
       }
     }
     case 'insert_image': {
@@ -404,7 +444,7 @@ export function executeTool(
   // synchronously (doesn't break existing tests). No settle here: marking the doc
   // seen after the long download would baptize user edits made meanwhile —
   // insert_image maintains the baseline itself right at its synchronous write.
-  if (call.name === 'web_search' || call.name === 'image_search' || call.name === 'insert_image') {
+  if (call.name === 'web_search' || call.name === 'image_search' || call.name === 'web_fetch' || call.name === 'insert_image') {
     return executeAsyncTool(editor, call, signal)
   }
   return settle(executeSyncTool(editor, call, numIds, track))

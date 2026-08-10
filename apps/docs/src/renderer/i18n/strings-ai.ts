@@ -1,4 +1,4 @@
-import { defineStrings } from '@genoffice/i18n'
+﻿import { defineStrings } from '@genoffice/i18n'
 
 /** User-visible strings for the ai/ panel and tool feedback (LLM prompts are not here) */
 export const aiStrings = defineStrings({
@@ -71,6 +71,8 @@ export const aiStrings = defineStrings({
     aiSumReadAttachmentName: '读取附件 {name}',
     aiSumWebSearch: '联网搜索',
     aiSumWebSearchDone: '搜索“{query}”({count} 条)',
+    aiSumWebFetch: '网页抓取',
+    aiSumWebFetchDone: '抓取网页 {url}',
     aiSumImageSearch: '图片搜索',
     aiSumImageSearchDone: '搜图“{query}”({count} 张)',
     aiSumInsertImage: '插入图片',
@@ -179,6 +181,8 @@ export const aiStrings = defineStrings({
     aiSumReadAttachmentName: 'Read attachment {name}',
     aiSumWebSearch: 'Web search',
     aiSumWebSearchDone: 'Searched "{query}" ({count} results)',
+    aiSumWebFetch: 'Web fetch',
+    aiSumWebFetchDone: 'Fetched web page {url}',
     aiSumImageSearch: 'Image search',
     aiSumImageSearchDone: 'Image search "{query}" ({count} images)',
     aiSumInsertImage: 'Insert image',

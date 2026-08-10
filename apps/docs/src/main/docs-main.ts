@@ -53,6 +53,7 @@ import {
   hasGskAuth,
   webSearch,
   imageSearch,
+  webFetch,
 } from '@genoffice/ai-search'
 import type {
   AttachmentAddResult,
@@ -2483,8 +2484,6 @@ export function registerAiIpc(): void {
   ipcMain.handle('ai:get-settings', (): AiSettings => {
     const stored = readJson<Partial<AiSettings> & LegacyAiSettings>(SETTINGS_PATH(), {})
     const settings = resolveAiSettings(stored, defaultAiSettings())
-    // AI features all go through Genspark (gsk login); legacy settings with another provider are reset
-    settings.provider = 'genspark'
     return settings
   })
 
@@ -2591,6 +2590,25 @@ export function registerAiIpc(): void {
       return await imageSearch(String(query), typeof maxResults === 'number' ? maxResults : 8)
     } catch (err) {
       return { images: [], method: 'error', error: String(err) }
+    }
+  })
+  ipcMain.handle('ai:web-fetch', async (_event, url: string) => {
+    try {
+      console.log('[ai:web-fetch] Starting fetch for:', url)
+      const result = await webFetch(String(url))
+      console.log('[ai:web-fetch] Success, method:', result.method, 'content length:', result.content.length, 'title:', result.title)
+      // Ensure the response has the exact structure the renderer expects
+      return {
+        content: String(result.content),
+        title: result.title || undefined,
+        method: result.method
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      const errorStack = err instanceof Error ? err.stack : undefined
+      console.error('[ai:web-fetch] Failed:', errorMsg)
+      if (errorStack) console.error('[ai:web-fetch] Stack:', errorStack)
+      return { content: '', method: 'error', error: errorMsg, stack: errorStack }
     }
   })
 

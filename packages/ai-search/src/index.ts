@@ -6,6 +6,8 @@
  * For gsk auth see ./gsk.ts (`gsk login` or GSK_API_KEY).
  */
 
+import TurndownService from 'turndown'
+import { fetchWithSsrfGuard } from '@genoffice/electron-utils'
 import {
   COPYRIGHT_HOSTS,
   asRecord,
@@ -13,7 +15,7 @@ import {
   type ImageSearchResult,
   type WebSearchResult,
 } from './shared'
-import { gskImageSearch, gskWebSearch, hasGskAuth } from './gsk'
+import { gskChildEnv, gskImageSearch, gskWebSearch, hasGskAuth } from './gsk'
 
 export type { ImageSearchResult, WebSearchResult } from './shared'
 export * from './gsk'
@@ -221,4 +223,33 @@ function decodeDuckUrl(href: string): string {
   const m = /[?&]uddg=([^&]+)/.exec(href)
   if (m) return decodeURIComponent(m[1]!)
   return href.startsWith('http') ? href : ''
+}
+
+// ── Web content fetch ───────────────────────────────────────────────
+
+export interface WebFetchResult {
+  content: string
+  title?: string
+  method: string
+}
+
+const turndownService = new TurndownService({
+  headingStyle: 'atx',
+  codeBlockStyle: 'fenced',
+})
+
+export async function webFetch(url: string): Promise<WebFetchResult> {
+  const headers: Record<string, string> = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+  }
+  const resp = await fetchWithSsrfGuard(url, { headers })
+  if (!resp) throw new Error(`Failed to fetch ${url}: blocked or invalid`)
+  if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status} ${resp.statusText}`)
+  const html = await resp.text()
+  const markdown = turndownService.turndown(html)
+  const titleMatch = /<title[^>]*>([^<]+)<\/title>/i.exec(html)
+  const title = titleMatch ? titleMatch[1].trim() : undefined
+  return { content: markdown, title, method: 'fetch' }
 }
