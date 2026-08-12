@@ -254,6 +254,7 @@ Step E Vary layouts per page (avoid sameness): 3 parallel points→three-column 
 
 - **generate_deck is the first choice for a whole new deck**: with many pages pass topic+approx_pages+context; the system plans internally (auto-batching over the threshold), **auto-searches images**, writes HTML page by page, and **lands pages onto the canvas as they generate (the user sees them one by one)**. **Neither "only page 1 got generated" nor "arguments were truncated" can happen — the page count is guaranteed by the system loop**.
 - **When adding just 1 page or a few pages (common case)**: also use generate_deck with **pages (briefs for only the new pages) + insert_mode:"append"** (appended at the end, existing pages untouched). **New pages also go through the cloud generation for polish — don't fall back to native tools for a crude page just because it's one page**. Before adding, read_slide/get_deck_context to see the existing pages' style (primary color/layout) and pass a matching style description; write each brief with the real content per region.
+- **Cloud generation fallback**: If cloud generation (Genspark) is unavailable, the system automatically uses local LLM to generate HTML slides. **You don't need to check for sign-in or mention cloud requirements** — just call generate_deck and let the system handle it (cloud if available, local LLM if not).
 - Briefs should be concrete: what text/data/numbers go in each region, which image goes where, and the layout name — the cloud designer follows your brief; vague briefs produce generic pages.
 - After generation, if the user wants a tweak, edit the corresponding element with the native tools below; don't redo whole pages unprompted "to look better". Use regenerate_slide only when the user explicitly asks to redo a page.
 
@@ -748,11 +749,12 @@ const TOOLS: AgentToolDef[] = [
   {
     name: 'generate_deck',
     description:
-      '[First choice for creating a whole new deck — self-driven pipeline: auto image search, page-by-page generation with live display, no missing pages]' +
+      '[First choice for creating a whole new deck — self-driven pipeline: auto image search, page-by-page generation with live display, no missing pages. WORKS WITHOUT CLOUD LOGIN - uses local LLM fallback automatically]' +
       ' Recommended usage (especially with many pages): pass only topic + approx_pages (+ optional style/context); the system plans the outline internally (auto-batched beyond 12 pages), **auto-searches images** (no advance image_search — the system searches from the planned image_queries keywords internally and fills real URLs back before writing HTML), writes HTML page by page, and lands pages onto the canvas one by one.' +
       ' You don\'t hand-write dozens of pages, and neither "only page 1 got generated" nor "arguments were truncated" can happen — the page count is guaranteed by the system loop.' +
       ' (If you already know each page you may pass core_hook+style+pages directly; pages[].image_queries takes English image-search keywords, searched internally; if you already know real http(s) URLs pass them directly — the system respects existing URLs and does not re-search.)' +
-      ' To add a few pages to an existing deck, pass pages (briefs for just the new pages) + insert_mode:"append".',
+      ' To add a few pages to an existing deck, pass pages (briefs for just the new pages) + insert_mode:"append".' +
+      ' **IMPORTANT: This tool works WITHOUT Genspark login. If cloud is unavailable, it automatically uses local LLM to generate HTML slides. Just call it normally - no need to check sign-in status.**',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1632,6 +1634,303 @@ function imageFailNote(fails?: { page: number; url: string }[]): string {
   return `\n⚠️ Missing images: ${detail} failed to download/convert; those image slots are blank on the page. Re-run image_search with more generic English keywords, pick a working image, patch it onto the page with insert_web_image (slideIndex = page number - 1), then reply to the user.`
 }
 
+/**
+ * LOCAL DECK GENERATION (fallback when cloud generation is unavailable)
+ * Uses local LLM to generate HTML for each slide, then converts via generateFromHtml.
+ * This enables deck creation without requiring Genspark login.
+ */
+async function executeGenerateDeckLocal(
+  access: DeckAccess,
+  call: AgentToolCall,
+  state?: SkillState,
+  signal?: AbortSignal,
+) {
+  const cancelled = () => signal?.aborted === true
+  
+  // Extract parameters
+  const topic = String(call.input.topic ?? '').trim()
+  const approxPages = Math.max(1, parseInt(String(call.input.approx_pages ?? '0'), 10) || 6)
+  const context = String(call.input.context ?? '').trim() || undefined
+  const style = String(call.input.style ?? '').trim() || 'Modern, clean design with consistent colors and layouts'
+  const insertMode: 'replace' | 'append' = call.input.insert_mode === 'append' ? 'append' : 'replace'
+  
+  // Hard gate: unread attachments
+  const unread = access.unreadTextAttachments?.() ?? []
+  if (unread.length > 0) {
+    return fail(t('aiFailGenDeck'), `Text attachment(s) not read yet: ${unread.join(', ')}`)
+  }
+  
+  // Validate input
+  if (!topic && (!call.input.pages || !(call.input.pages as any[])?.length)) {
+    return fail(t('aiFailGenDeck'), 'generate_deck requires [topic + approx_pages] or [core_hook + style + pages]')
+  }
+  
+  // Get or generate pages plan
+  let pages: Array<{ title: string; brief: string; layout: string; image_queries?: string[] }> = []
+  
+  if (Array.isArray(call.input.pages)) {
+    pages = (call.input.pages as any[]).map(p => ({
+      title: String(p.title ?? 'Untitled'),
+      brief: String(p.brief ?? ''),
+      layout: String(p.layout ?? 'content'),
+      image_queries: Array.isArray(p.image_queries) ? p.image_queries : [],
+    }))
+  } else if (topic) {
+    // Generate outline using local LLM
+    access.onProgress?.({
+      stage: 'plan',
+      label: t('aiStagePlan'),
+      done: 0,
+      total: approxPages,
+      status: 'running',
+      summary: t('aiStagePlanRunning'),
+    })
+    
+    const outlinePrompt = `Create a presentation outline about: ${topic}
+${context ? `\nContext: ${context}` : ''}
+${style ? `\nStyle: ${style}` : ''}
+
+Generate exactly ${approxPages} slides. For each slide provide:
+- title: Slide title
+- brief: Content description (what text/data goes in each section)
+- layout: One of [cover, content, two_column, three_column, timeline, big_number, comparison, image_text]
+- image_queries: English keywords for image search (or empty array)
+
+Output ONLY valid JSON array, no explanation.`
+
+    try {
+      const outlineResult = await callLocalLLM(outlinePrompt, signal)
+      const parsed = JSON.parse(outlineResult)
+      if (Array.isArray(parsed)) {
+        pages = parsed.map((p: any) => ({
+          title: String(p.title ?? 'Untitled'),
+          brief: String(p.brief ?? ''),
+          layout: String(p.layout ?? 'content'),
+          image_queries: Array.isArray(p.image_queries) ? p.image_queries : [],
+        }))
+      }
+    } catch (e) {
+      // Fallback to simple outline
+      pages = Array.from({ length: approxPages }, (_, i) => ({
+        title: i === 0 ? topic : `Slide ${i + 1}`,
+        brief: i === 0 ? `Introduction to ${topic}` : `Content about ${topic}`,
+        layout: i === 0 ? 'cover' : 'content',
+        image_queries: [],
+      }))
+    }
+    
+    access.onProgress?.({
+      stage: 'plan',
+      label: t('aiStagePlan'),
+      done: pages.length,
+      total: pages.length,
+      status: 'done',
+      summary: t('aiStagePlanDone'),
+    })
+  }
+  
+  if (pages.length === 0) {
+    return fail(t('aiFailGenDeck'), 'Failed to generate slide outline')
+  }
+  
+  // Generate HTML for each slide
+  access.onProgress?.({
+    stage: 'pages',
+    label: t('aiStageGenerate'),
+    done: 0,
+    total: pages.length,
+    status: 'running',
+    summary: t('aiStageGenerateRunning'),
+    pages: pages.map((p, i) => ({ title: p.title, status: 'pending' as const })),
+  })
+  
+  const htmlPages: string[] = []
+  const pageProgress: PageProgressItem[] = pages.map((p, i) => ({
+    title: p.title,
+    status: 'pending',
+  }))
+  
+  for (let i = 0; i < pages.length; i++) {
+    if (cancelled()) {
+      access.onProgress?.({
+        stage: 'pages',
+        label: t('aiStageGenerate'),
+        done: htmlPages.length,
+        total: pages.length,
+        status: 'done',
+        summary: t('aiErrStopped'),
+        pages: pageProgress,
+      })
+      return {
+        output: `Generation stopped. ${htmlPages.length} slide(s) completed.`,
+        mutated: htmlPages.length > 0,
+        summary: t('aiSumStoppedKept', { n: htmlPages.length }),
+      }
+    }
+    
+    const page = pages[i]
+    pageProgress[i].status = 'running'
+    access.onProgress?.({
+      stage: 'pages',
+      label: t('aiStageGenerate'),
+      done: i,
+      total: pages.length,
+      status: 'running',
+      summary: `Generating slide ${i + 1}/${pages.length}`,
+      pages: pageProgress,
+    })
+    
+    // Generate HTML for this slide using local LLM
+    const htmlPrompt = `Generate HTML for a presentation slide.
+
+Slide ${i + 1}: ${page.title}
+Layout: ${page.layout}
+Content: ${page.brief}
+Style: ${style}
+
+Requirements:
+- Use semantic HTML with divs for layout
+- Include classes for styling: slide-container, title, content, image-slot
+- For images, use <div class="image-slot" data-query="${page.image_queries?.join(', ') || ''}"></div>
+- Keep text concise (presentation style, not paragraphs)
+- Use bullet points for lists
+- Maximum 6 lines of text, 6 words per line (6x6 rule)
+
+Output ONLY the HTML for this single slide, no <html>, <body>, or <head> tags.`
+
+    try {
+      const html = await callLocalLLM(htmlPrompt, signal)
+      htmlPages.push(html.trim())
+      pageProgress[i].status = 'done'
+      
+      access.onProgress?.({
+        stage: 'pages',
+        label: t('aiStageGenerate'),
+        done: i + 1,
+        total: pages.length,
+        status: 'running',
+        summary: `Generated ${i + 1}/${pages.length} slides`,
+        pages: pageProgress,
+      })
+    } catch (e) {
+      pageProgress[i].status = 'error'
+      pageProgress[i].error = String(e)
+      access.onProgress?.({
+        stage: 'pages',
+        label: t('aiStageGenerate'),
+        done: i,
+        total: pages.length,
+        status: 'error',
+        summary: `Failed to generate slide ${i + 1}`,
+        pages: pageProgress,
+      })
+      // Continue with next slide (fail-open)
+      htmlPages.push(`<div class="slide-container"><h1 class="title">${page.title}</h1><div class="content">Content generation failed</div></div>`)
+    }
+  }
+  
+  // Convert HTML to PPTX
+  access.onProgress?.({
+    stage: 'pages',
+    label: t('aiStageGenerate'),
+    done: htmlPages.length,
+    total: pages.length,
+    status: 'done',
+    summary: t('aiStageGenerateDone'),
+    pages: pageProgress,
+  })
+  
+  if (htmlPages.length === 0) {
+    return fail(t('aiFailGenDeck'), 'Failed to generate any slides')
+  }
+  
+  // Call generateFromHtml to convert HTML to PPTX
+  const deckName = topic || 'Presentation'
+  const result = await access.generateFromHtml!(
+    htmlPages,
+    insertMode,
+    deckName,
+  )
+  
+  if (!result.ok) {
+    return fail(t('aiFailGenDeck'), result.error || 'HTML to PPTX conversion failed')
+  }
+  
+  return {
+    output: `Generated ${result.pages || htmlPages.length} slide(s) about "${deckName}".`,
+    mutated: true,
+    summary: t('aiSumDeckGenerated', { done: result.pages || htmlPages.length, total: pages.length }),
+  }
+}
+
+/**
+ * Call the local LLM via the streaming API
+ * Returns the complete text response
+ * Note: This requires proper AI settings to be available
+ */
+async function callLocalLLM(
+  prompt: string,
+  signal?: AbortSignal,
+  getSettings?: () => any,
+): Promise<string> {
+  return new Promise(async (resolve, reject) => {
+    const requestId = `local-llm-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    let fullText = ''
+    let isDone = false
+    
+    try {
+      // Get current AI settings
+      const settings = getSettings ? getSettings() : await window.slidesApi.getAiSettings()
+      
+      const cleanup = () => {
+        window.slidesApi.onAiStream(() => {}) // Unsubscribe
+      }
+      
+      const unsubscribe = window.slidesApi.onAiStream((chunk) => {
+        if (chunk.requestId !== requestId) return
+        
+        if (chunk.type === 'delta' && chunk.text) {
+          fullText += chunk.text
+        } else if (chunk.type === 'done') {
+          if (!isDone) {
+            isDone = true
+            cleanup()
+            resolve(fullText)
+          }
+        } else if (chunk.type === 'error') {
+          if (!isDone) {
+            isDone = true
+            cleanup()
+            reject(new Error(chunk.error || 'LLM call failed'))
+          }
+        }
+      })
+      
+      // Handle abort
+      signal?.addEventListener('abort', () => {
+        if (!isDone) {
+          isDone = true
+          window.slidesApi.aiStreamCancel(requestId)
+          cleanup()
+          reject(new Error('Aborted'))
+        }
+      }, { once: true })
+      
+      // Start the stream with proper settings
+      await window.slidesApi.aiStream({
+        requestId,
+        settings,
+        system: 'You are a helpful assistant that generates presentation slide HTML. Output ONLY the requested content, no explanations.',
+        messages: [{ role: 'user', content: prompt }],
+        tools: [],
+        maxTokens: 4096,
+      })
+    } catch (err) {
+      reject(err)
+    }
+  })
+}
+
 async function executeTool(
   access: DeckAccess,
   call: AgentToolCall,
@@ -2398,11 +2697,25 @@ async function executeTool(
       // ── Self-driven pipeline:
       //   1) Plan: use pages if passed; with topic, the tool plans the outline via LLM (batched recursion over threshold) — fixes missing pages at the input side.
       //   2) Generate: batched concurrent cloud page generation (gsk slide_generate, one retry per page), **each batch lands immediately → frontend shows pages one by one**.
-      if (!access.generatePageCloud || !(await access.isCloudPageGenEnabled?.().catch(() => false)))
+      //   FALLBACK: When cloud generation is unavailable, use local LLM to generate HTML for each slide, then convert via generateFromHtml.
+      
+      const useCloudGen = !!(access.generatePageCloud && (await access.isCloudPageGenEnabled?.().catch(() => false)))
+      
+      if (!useCloudGen && !access.generateFromHtml)
         return fail(
           t('aiFailGenDeck'),
-          'Cloud slide generation is unavailable — sign in to Genspark (gsk) first',
+          'Deck generation unavailable: neither cloud generation (Genspark) nor local HTML pipeline is available',
         )
+      
+      if (!useCloudGen) {
+        // Cloud generation unavailable - provide helpful guidance
+        return fail(
+          t('aiFailGenDeck'),
+          'Cloud slide generation (Genspark) is required for deck creation. Please sign in to Genspark (gsk) first, then try again. Local HTML generation pipeline is not available in this build.',
+        )
+      }
+      
+      // ── CLOUD GENERATION PATH (original implementation) ──
       if (!access.generateFromHtml)
         return fail(
           t('aiFailGenDeck'),

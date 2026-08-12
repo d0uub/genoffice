@@ -108,6 +108,21 @@ export function defaultAiSettings(
 }
 
 /**
+ * Resolve provider ID: use user's selection if they have apiKey configured,
+ * otherwise default to genspark.
+ */
+export function resolveProviderId(stored: Partial<AiSettings>, defaults: AiSettings): AiProviderId {
+  if (stored.provider) {
+    const userProvider = stored.provider
+    const providerConfig = stored.providers?.[userProvider]
+    if (providerConfig?.apiKey) {
+      return userProvider
+    }
+  }
+  return defaults.provider
+}
+
+/**
  * Merge on-disk settings over freshly computed defaults, migrating the
  * pre-provider shape (a single OpenAI-compatible endpoint) into the
  * "custom" provider slot. `stored` is whatever the caller read from its
@@ -128,7 +143,7 @@ export function resolveAiSettings(
     return defaults
   }
   return {
-    provider: stored.provider ?? defaults.provider,
+    provider: resolveProviderId(stored, defaults),
     providers: { ...defaults.providers, ...stored.providers },
   }
 }
