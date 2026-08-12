@@ -17,6 +17,8 @@ interface Box {
 export interface LocalDrawing {
   id: string
   input: DrawingInput
+  /** Present when this drawing is the visual value placed into an AcroForm /Sig widget. */
+  formWidgetId?: string
 }
 
 /** 5-color palette (0-1 rgb), same visual language as the markup floating bar */
@@ -432,7 +434,8 @@ export function DrawLayer({
               key={d.id}
               className={`pdf-note-pin${d.id === selectedId ? ' pdf-note-pin-selected' : ''}`}
               style={{ left: vx, top: vy - 20, background: cssRgb(note.color) }}
-              title={`${note.contents}\n\n${selectTitle}`}
+              data-tip={`${note.contents}\n\n${selectTitle}`}
+              aria-label={`${note.contents}\n\n${selectTitle}`}
               onClick={(e) => onSelect(d.id, e.clientX, e.clientY)}
             >
               <svg

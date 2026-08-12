@@ -38,6 +38,7 @@ import type { RibbonFormatState } from './ribbon-format-state'
 import { setSelectedColumnWidth } from '../editor/table-sizing'
 import { useI18n, type StringKey } from '../i18n/locale'
 import { fontFamiliesFor, isEastAsianFontName } from '../font-list'
+import { useSystemFontFamilies } from '../system-fonts'
 import { cssFontFamily } from '../line-metrics'
 import {
   DesignTab,
@@ -826,6 +827,11 @@ function RibbonInner({
           imageDataUrl: dataUrl,
           imageWidthPx: w,
           imageHeightPx: h,
+          // The new bytes are the full picture (crop/cutout bake destructively) and
+          // the replace pipeline strips a:srcRect on save — drop a Word-authored
+          // crop/fill window or it would keep clipping the new image until reload
+          imageCrop: null,
+          imageFillRect: null,
           ...(isOriginal
             ? { imageReplace: { base64: m[2], mime: m[1] } }
             : { genImage: { base64: m[2], mime: m[1], widthPx: w, heightPx: h } }),
@@ -1082,6 +1088,7 @@ function RibbonInner({
   // computed unconditionally (not inside the dropdown render): cheap, and the
   // render-isolation test uses fontFamiliesFor calls as its render probe
   const fontFamilies = fontFamiliesFor(lang)
+  const { families: systemFontFamilies, load: loadSystemFonts } = useSystemFontFamilies()
   // unset align follows the paragraph direction: start is left in LTR, right in RTL
   const activeAlign = fs.align ?? (fs.bidi ? 'right' : 'left')
   const activeSpacing = fs.lineSpacing
@@ -2273,7 +2280,10 @@ function RibbonInner({
                       className="rb-caret rb-combo-caret"
                       disabled={!canEdit}
                       title={t('ribbonFontFamilyTip')}
-                      onClick={() => setDropdown((v) => (v === 'fontFamily' ? null : 'fontFamily'))}
+                      onClick={() => {
+                        if (dropdown !== 'fontFamily') loadSystemFonts()
+                        setDropdown((v) => (v === 'fontFamily' ? null : 'fontFamily'))
+                      }}
                     >
                       <IconCaret />
                     </button>
@@ -2298,6 +2308,23 @@ function RibbonInner({
                               {f}
                             </button>
                           ))}
+                        {systemFontFamilies.length > 0 && (
+                          <>
+                            <div className="rb-menu-group-label">{t('ribbonFontsSystem')}</div>
+                            {systemFontFamilies
+                              .filter((f) => f !== bodyFontName)
+                              .map((f) => (
+                                <button
+                                  key={f}
+                                  className={f === currentFont ? 'active' : ''}
+                                  style={{ fontFamily: cssFontFamily(f) }}
+                                  onClick={() => setFont(f)}
+                                >
+                                  {f}
+                                </button>
+                              ))}
+                          </>
+                        )}
                       </div>
                     )}
                   </div>

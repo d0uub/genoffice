@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactElement } from 'react'
 import { pdfRectToCss, viewToPdf } from './annotations'
 import type { PageGeom } from './annotations'
-import type { ImageEditInput, PageImageRef } from '../shared/ipc'
+import type { ImageEditInput, PageImageRef, StaticFormFillRecord } from '../shared/ipc'
 
 type Rect = [number, number, number, number]
 
@@ -13,6 +13,12 @@ export interface LocalImageEdit {
   png?: string | null
   /** Z-band the existing image had before this op (labels the layer toggle) */
   origAbove?: boolean
+  /** Editable source metadata when this image is a static form fill. */
+  staticFill?: StaticFormFillRecord
+  /** Pre-transparency pixels of the op's current bytes: transparency presets re-bake
+      from this so they set an absolute level instead of compounding. Cleared by any
+      other pixel edit (flip/crop/cutout/replace/insert-rotate). */
+  opacityBase?: string
 }
 
 /** Existing images are addressed by their listed rect; stable across renders, not saves */
@@ -261,7 +267,7 @@ export function ImageEditLayer({
           key={e.id}
           className={`pdf-imgedit-del${sel ? ' pdf-imgedit-selected' : ''}`}
           style={css(e.input.oldRect)}
-          title={editHint}
+          data-tip={editHint}
           onClick={(ev) => {
             ev.stopPropagation()
             onSelectEdit(e.id, ev.clientX, ev.clientY)
@@ -291,7 +297,7 @@ export function ImageEditLayer({
           className={`pdf-imgedit-img${sel ? ' pdf-imgedit-selected' : ''}`}
           src={`data:image/png;base64,${src}`}
           style={ghostStyle(target, e.input.rect, turns)}
-          title={editHint}
+          data-tip={editHint}
           alt=""
           draggable={false}
           {...pointerProps(target, e.input.rect)}
@@ -305,7 +311,7 @@ export function ImageEditLayer({
           key={e.id}
           className={`pdf-imgedit-ghostbox${sel ? ' pdf-imgedit-selected' : ''}`}
           style={dragStyle(target, e.input.rect)}
-          title={editHint}
+          data-tip={editHint}
           {...pointerProps(target, e.input.rect)}
         />,
       )
@@ -341,7 +347,7 @@ export function ImageEditLayer({
         key={key}
         className={`pdf-imgedit-hit${key === selectedKey ? ' pdf-imgedit-selected' : ''}`}
         style={dragStyle(target, ref.rect)}
-        title={editHint}
+        data-tip={editHint}
         {...pointerProps(target, ref.rect)}
       />,
     )

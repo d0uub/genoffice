@@ -285,4 +285,28 @@ describe('image wrap in the editor', () => {
     expect(reparsed2.blocks[0].imageDataUrl?.startsWith('data:image/gif;base64,')).toBe(true)
     editor.destroy()
   })
+
+  it('imageReplace resets a non-default a:fillRect fill window', async () => {
+    const GIF_B64 = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+    // A Word-authored fill window clips like a crop: it must not survive onto
+    // the swapped bytes (the editor clears its imageFillRect attr in step)
+    const withFill = IMAGE_PARAGRAPH_XML.replace(
+      '</pic:blipFill>',
+      '<a:stretch><a:fillRect l="10000" t="10000" r="20000" b="5000"/></a:stretch></pic:blipFill>',
+    )
+    const { editor, parsed } = await openImageDoc(withFill)
+    editor.view.dispatch(editor.state.tr.setSelection(NodeSelection.create(editor.state.doc, 0)))
+    editor.commands.updateAttributes('docProtected', {
+      imageReplace: { base64: GIF_B64, mime: 'image/gif' },
+    })
+    const plan = pmDocToSavePlan(editor.getJSON() as PmNode, parsed.blocks)
+    expect(plan.changedCount).toBe(1)
+    const saved = await saveDocx(parsed, plan.saveBlocks)
+    const docXml = await (await JSZip.loadAsync(saved)).file('word/document.xml')!.async('string')
+    expect(docXml).toContain('<a:fillRect/>')
+    expect(docXml).not.toContain('<a:fillRect l=')
+    const reparsed2 = await parseDocx(saved)
+    expect(reparsed2.blocks[0].imageFillRect).toBeUndefined()
+    editor.destroy()
+  })
 })

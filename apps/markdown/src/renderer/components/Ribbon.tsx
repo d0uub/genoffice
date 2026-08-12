@@ -129,7 +129,8 @@ function IconBtn({
     <button
       type="button"
       className={`rb-btn${active ? ' active' : ''}`}
-      title={title}
+      data-tip={title}
+      aria-label={title}
       disabled={disabled}
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
@@ -225,7 +226,8 @@ export function Ribbon({
         <button
           type="button"
           className="qa-btn"
-          title={t('save')}
+          data-tip={t('save')}
+          aria-label={t('save')}
           disabled={off || !dirty}
           onMouseDown={(e) => e.preventDefault()}
           onClick={onSave}
@@ -235,7 +237,8 @@ export function Ribbon({
         <button
           type="button"
           className="qa-btn"
-          title={t('undo')}
+          data-tip={t('undo')}
+          aria-label={t('undo')}
           disabled={off || !state?.canUndo}
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => editor?.chain().focus().undo().run()}
@@ -245,14 +248,15 @@ export function Ribbon({
         <button
           type="button"
           className="qa-btn"
-          title={t('redo')}
+          data-tip={t('redo')}
+          aria-label={t('redo')}
           disabled={off || !state?.canRedo}
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => editor?.chain().focus().redo().run()}
         >
           <IconRedo size={16} />
         </button>
-        <label className={`autosave-toggle${autoSave ? ' on' : ''}`} title={t('autoSaveTip')}>
+        <label className={`autosave-toggle${autoSave ? ' on' : ''}`} data-tip={t('autoSaveTip')}>
           <span className="autosave-knob" />
           <span className="autosave-text">{t('autoSave')}</span>
           <input
@@ -269,7 +273,7 @@ export function Ribbon({
             <button
               type="button"
               className={`rb-big ai-entry${aiOpen ? ' active' : ''}`}
-              title={t('aiOpenAssistant')}
+              data-tip={t('aiOpenAssistant')}
               disabled={disabled}
               onMouseDown={(e) => e.preventDefault()}
               onClick={onToggleAi}
@@ -284,7 +288,7 @@ export function Ribbon({
                 key={kind}
                 type="button"
                 className="rb-big ai-entry"
-                title={t(prompt)}
+                data-tip={t(btn)}
                 disabled={off || state?.empty}
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => onAiPreset(t(prompt))}
@@ -302,147 +306,159 @@ export function Ribbon({
 
         <div className="rb-sep" />
 
-        <select
-          className="rb-style"
-          value={state?.style ?? 'paragraph'}
-          disabled={off}
-          onChange={(e) => editor && applyBlockStyle(editor, e.target.value as BlockStyle)}
-        >
-          {(Object.keys(STYLE_LABEL) as BlockStyle[]).map((s) => (
-            <option key={s} value={s}>
-              {t(STYLE_LABEL[s])}
-            </option>
-          ))}
-        </select>
+        <div className="ribbon-group">
+          <div className="ribbon-group-items">
+            <select
+              className="rb-style"
+              value={state?.style ?? 'paragraph'}
+              disabled={off}
+              onChange={(e) => editor && applyBlockStyle(editor, e.target.value as BlockStyle)}
+            >
+              {(Object.keys(STYLE_LABEL) as BlockStyle[]).map((s) => (
+                <option key={s} value={s}>
+                  {t(STYLE_LABEL[s])}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
 
         <div className="rb-sep" />
 
-        <div className="rb-group">
-          <IconBtn
-            title={t('bold')}
-            active={state?.bold}
-            disabled={off}
-            onClick={() => editor?.chain().focus().toggleBold().run()}
-          >
-            <span className="rb-glyph" style={{ fontWeight: 800 }}>
-              B
-            </span>
-          </IconBtn>
-          <IconBtn
-            title={t('italic')}
-            active={state?.italic}
-            disabled={off}
-            onClick={() => editor?.chain().focus().toggleItalic().run()}
-          >
-            <span className="rb-glyph" style={{ fontStyle: 'italic' }}>
-              I
-            </span>
-          </IconBtn>
-          <IconBtn
-            title={t('strike')}
-            active={state?.strike}
-            disabled={off}
-            onClick={() => editor?.chain().focus().toggleStrike().run()}
-          >
-            <span className="rb-glyph" style={{ textDecoration: 'line-through' }}>
-              S
-            </span>
-          </IconBtn>
-          <IconBtn
-            title={t('inlineCode')}
-            active={state?.code}
-            disabled={off}
-            onClick={() => editor?.chain().focus().toggleCode().run()}
-          >
-            <IconInlineCode size={ICON} />
-          </IconBtn>
-          <span className="rb-link-anchor">
-            <IconBtn title={t('link')} active={state?.link} disabled={off} onClick={openLink}>
-              <IconLink size={ICON} />
+        <div className="ribbon-group">
+          <div className="ribbon-group-items">
+            <IconBtn
+              title={t('bold')}
+              active={state?.bold}
+              disabled={off}
+              onClick={() => editor?.chain().focus().toggleBold().run()}
+            >
+              <b>B</b>
             </IconBtn>
-            {linkOpen && (
-              <span className="rb-link-pop" onMouseDown={(e) => e.stopPropagation()}>
-                <input
-                  ref={linkInputRef}
-                  value={linkUrl}
-                  placeholder={t('linkPlaceholder')}
-                  onChange={(e) => setLinkUrl(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') applyLink()
-                    if (e.key === 'Escape') setLinkOpen(false)
-                  }}
-                />
-                <button type="button" onClick={applyLink}>
-                  {t('linkApply')}
-                </button>
-              </span>
-            )}
-          </span>
+            <IconBtn
+              title={t('italic')}
+              active={state?.italic}
+              disabled={off}
+              onClick={() => editor?.chain().focus().toggleItalic().run()}
+            >
+              <i>I</i>
+            </IconBtn>
+            <IconBtn
+              title={t('strike')}
+              active={state?.strike}
+              disabled={off}
+              onClick={() => editor?.chain().focus().toggleStrike().run()}
+            >
+              <s>ab</s>
+            </IconBtn>
+            <IconBtn
+              title={t('inlineCode')}
+              active={state?.code}
+              disabled={off}
+              onClick={() => editor?.chain().focus().toggleCode().run()}
+            >
+              <IconInlineCode size={ICON} />
+            </IconBtn>
+            <span className="rb-link-anchor">
+              <IconBtn title={t('link')} active={state?.link} disabled={off} onClick={openLink}>
+                <IconLink size={ICON} />
+              </IconBtn>
+              {linkOpen && (
+                <span className="rb-link-pop" onMouseDown={(e) => e.stopPropagation()}>
+                  <input
+                    ref={linkInputRef}
+                    value={linkUrl}
+                    placeholder={t('linkPlaceholder')}
+                    onChange={(e) => setLinkUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') applyLink()
+                      if (e.key === 'Escape') setLinkOpen(false)
+                    }}
+                  />
+                  <button type="button" onClick={applyLink}>
+                    {t('linkApply')}
+                  </button>
+                </span>
+              )}
+            </span>
+          </div>
         </div>
 
         <div className="rb-sep" />
 
-        <div className="rb-group">
-          <IconBtn
-            title={t('bulletList')}
-            active={state?.bullet}
-            disabled={off}
-            onClick={() => editor?.chain().focus().toggleBulletList().run()}
-          >
-            <IconBullets size={ICON} />
-          </IconBtn>
-          <IconBtn
-            title={t('orderedList')}
-            active={state?.ordered}
-            disabled={off}
-            onClick={() => editor?.chain().focus().toggleOrderedList().run()}
-          >
-            <IconNumbered size={ICON} />
-          </IconBtn>
-          <IconBtn
-            title={t('taskList')}
-            active={state?.task}
-            disabled={off}
-            onClick={() => editor?.chain().focus().toggleTaskList().run()}
-          >
-            <IconTaskList size={ICON} />
-          </IconBtn>
+        <div className="ribbon-group">
+          <div className="ribbon-group-items">
+            <IconBtn
+              title={t('bulletList')}
+              active={state?.bullet}
+              disabled={off}
+              onClick={() => editor?.chain().focus().toggleBulletList().run()}
+            >
+              <IconBullets size={ICON} />
+            </IconBtn>
+            <IconBtn
+              title={t('orderedList')}
+              active={state?.ordered}
+              disabled={off}
+              onClick={() => editor?.chain().focus().toggleOrderedList().run()}
+            >
+              <IconNumbered size={ICON} />
+            </IconBtn>
+            <IconBtn
+              title={t('taskList')}
+              active={state?.task}
+              disabled={off}
+              onClick={() => editor?.chain().focus().toggleTaskList().run()}
+            >
+              <IconTaskList size={ICON} />
+            </IconBtn>
+          </div>
         </div>
 
         <div className="rb-sep" />
 
-        <div className="rb-group">
-          <IconBtn
-            title={t('insertTable')}
-            disabled={off}
-            onClick={() =>
-              editor?.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()
-            }
-          >
-            <IconTable size={ICON} />
-          </IconBtn>
-          <IconBtn title={t('insertImage')} disabled={off || !imageEnabled} onClick={onInsertImage}>
-            <IconPicture size={ICON} />
-          </IconBtn>
-          <IconBtn
-            title={t('insertHr')}
-            disabled={off}
-            onClick={() => editor?.chain().focus().setHorizontalRule().run()}
-          >
-            <IconHr size={ICON} />
-          </IconBtn>
+        <div className="ribbon-group">
+          <div className="ribbon-group-items">
+            <IconBtn
+              title={t('insertTable')}
+              disabled={off}
+              onClick={() =>
+                editor?.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()
+              }
+            >
+              <IconTable size={ICON} />
+            </IconBtn>
+            <IconBtn
+              title={t('insertImage')}
+              disabled={off || !imageEnabled}
+              onClick={onInsertImage}
+            >
+              <IconPicture size={ICON} />
+            </IconBtn>
+            <IconBtn
+              title={t('insertHr')}
+              disabled={off}
+              onClick={() => editor?.chain().focus().setHorizontalRule().run()}
+            >
+              <IconHr size={ICON} />
+            </IconBtn>
+          </div>
         </div>
 
         <div className="rb-spacer" />
 
-        <IconBtn
-          title={t('fmProperties')}
-          active={frontmatterOpen}
-          disabled={disabled}
-          onClick={onToggleFrontmatter}
-        >
-          <IconProperties size={ICON} />
-        </IconBtn>
+        <div className="ribbon-group">
+          <div className="ribbon-group-items">
+            <IconBtn
+              title={t('fmProperties')}
+              active={frontmatterOpen}
+              disabled={disabled}
+              onClick={onToggleFrontmatter}
+            >
+              <IconProperties size={ICON} />
+            </IconBtn>
+          </div>
+        </div>
       </div>
     </div>
   )

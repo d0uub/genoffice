@@ -643,7 +643,10 @@ function _placeTable(
       // in-row page break (Word default): without cantSplit and with safe cut points,
       // place segment by segment at the cut points. If the first segment doesn't fit,
       // turn the page first (equivalent to pushing the whole row)
-      let cuts = !row.cantSplit && row.cutYs ? [...row.cutYs] : []
+      // Word never splits the first/header row: push whole (over-page rows still split)
+      const keepWhole =
+        (ri === 0 || (row.isHeader && ri < headerRows)) && row.height <= contentH + 0.01
+      let cuts = !row.cantSplit && !keepWhole && row.cutYs ? [...row.cutYs] : []
       const placeSegments = (bounds: number[]) => {
         let prev = 0
         for (const cut of bounds) {
@@ -904,6 +907,26 @@ export function effectiveTopPx(set: SectionSettings, headerPx: number): number {
 export function effectiveBottomPx(set: SectionSettings, footerPx: number): number {
   const dist = twipsToPx(set.footerDist ?? 720)
   return Math.max(twipsToPx(set.marginBottom), footerPx > 0 ? dist + footerPx : 0)
+}
+
+/**
+ * Uniform typed line grid (w:docGrid type lines/linesAndChars): the pitch in
+ * points when EVERY section declares the same typed pitch, else null. Mixed or
+ * untyped docs don't snap (matches LO only for the uniform case; per-section
+ * pitches would need per-block plumbing, and mixed-grid docs are rare).
+ * The value feeds .doc-page { --doc-grid-pitch } which line-height round(up)
+ * expressions consume.
+ */
+export function docGridPitchPt(sections: SectionInfo[]): number | null {
+  if (sections.length === 0) return null
+  let pitch: number | null = null
+  for (const s of sections) {
+    const g = s.settings.docGrid
+    if (!g || (g.type !== 'lines' && g.type !== 'linesAndChars') || !g.linePitch) return null
+    if (pitch === null) pitch = g.linePitch
+    else if (pitch !== g.linePitch) return null
+  }
+  return pitch === null ? null : pitch / 20
 }
 
 /** Equal-width column count of a section (w:cols w:num).

@@ -9,7 +9,15 @@ import {
   cssCsFontFamily,
   cssDualFontFamily,
   cssFontFamily,
+  cssGridLineBase,
+  cssGridSpacingPt,
+  cssLineHeight,
+  isCjkFontName,
+  lineHeightFactor,
+  paraLineFactorCss,
+  textHasCjk,
   textHasComplexScript,
+  textHasHangul,
 } from '../line-metrics'
 import { shapeBackgroundCss } from './shape-svg'
 import { t } from '../i18n/locale'
@@ -19,6 +27,7 @@ import {
   type FormulaDisplay,
   type Run,
   type TableModel,
+  type TableParagraph,
   type TextboxDisplay,
 } from '@genoffice/docx-engine'
 
@@ -62,7 +71,9 @@ export function renderFieldSpec(field: FieldDisplay): DomSpec | null {
       attrs,
       ...num,
       ['span', { class: 'doc-toc-title', contenteditable: 'false' }, field.left || '\u00a0'],
-      ['span', { class: 'doc-toc-dots' }],
+      // real dot glyphs (clipped to the free width), not a border decoration:
+      // Word/LO leader dots are text, and exported-PDF text comparison sees them
+      ['span', { class: 'doc-toc-dots', contenteditable: 'false' }, '.'.repeat(220)],
       ['span', { class: 'doc-toc-page', contenteditable: 'false' }, field.right ?? ''],
     ]
   }
@@ -170,6 +181,13 @@ export function renderChartSpec(chart: ChartDisplay): DomSpec {
 
 const SVG_NS = 'http://www.w3.org/2000/svg'
 
+/** round up to a 1/2/5×10ⁿ "nice" axis step */
+function niceStep(target: number): number {
+  const pow = 10 ** Math.floor(Math.log10(Math.max(target, 1e-9)))
+  const n = target / pow
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * pow
+}
+
 interface ChartGeom {
   width: number
   height: number
@@ -186,13 +204,18 @@ export const CHART_MAX_WIDTH_PX = 660
 export function drawChartSvg(dom: HTMLElement, chart: ChartDisplay | null): void {
   const canvas = dom.querySelector<HTMLElement>('.doc-chart-canvas')
   if (!canvas || !chart?.series.length) return
+  // series-name legend inside the SVG: the data grid is an editing affordance
+  // (hidden unless the block is selected), so the printed chart must carry the
+  // legend itself, like Word/LibreOffice output
+  const legendNames = chart.series.map((s, i) => s.name ?? t('editorChartSeries', { num: i + 1 }))
+  const showLegend = chart.series.length > 1 || chart.series.some((s) => s.name)
   const geom: ChartGeom = {
     width: Math.min(chart.widthPx ?? 560, CHART_MAX_WIDTH_PX),
     height: chart.heightPx ?? 240,
     left: 46,
     right: 12,
     top: 12,
-    bottom: 26,
+    bottom: 26 + (showLegend ? 18 : 0),
   }
   const svg = document.createElementNS(SVG_NS, 'svg')
   svg.setAttribute('viewBox', `0 0 ${geom.width} ${geom.height}`)
@@ -202,6 +225,31 @@ export function drawChartSvg(dom: HTMLElement, chart: ChartDisplay | null): void
 
   if (chart.kind === 'pie') drawPie(svg, chart, geom)
   else drawAxes(svg, chart, geom)
+
+  if (showLegend) {
+    const slot = geom.width / legendNames.length
+    legendNames.forEach((name, i) => {
+      const cx = slot * i + slot / 2
+      svgEl(svg, 'rect', {
+        x: String(cx - Math.min(name.length * 3.2, slot / 2 - 14) - 12),
+        y: String(geom.height - 15),
+        width: '8',
+        height: '8',
+        fill: chartColor(i),
+      })
+      svgEl(
+        svg,
+        'text',
+        {
+          x: String(cx),
+          y: String(geom.height - 7),
+          class: 'doc-chart-axis-label',
+          'text-anchor': 'middle',
+        },
+        name,
+      )
+    })
+  }
 
   canvas.replaceChildren(svg)
 }
@@ -222,8 +270,14 @@ function svgEl(
 /** bar / line / area charts share the same axes and scale */
 function drawAxes(svg: SVGElement, chart: ChartDisplay, geom: ChartGeom): void {
   const values = chart.series.flatMap((s) => s.values).filter((v): v is number => v !== null)
-  const max = Math.max(0, ...values)
-  const min = Math.min(0, ...values)
+  // "nice" axis bounds (1/2/5×10ⁿ step, integer-friendly labels like Word/LO)
+  const rawMax = Math.max(0, ...values)
+  const rawMin = Math.min(0, ...values)
+  const step = niceStep((rawMax - rawMin) / 5 || 1)
+  const min = Math.floor(rawMin / step) * step
+  // Word/LO leave headroom: the top tick sits strictly above the data maximum
+  let max = Math.ceil(rawMax / step) * step || step
+  if (rawMax > 0 && max <= rawMax + 1e-9) max += step
   const span = max - min || 1
   const plotW = geom.width - geom.left - geom.right
   const plotH = geom.height - geom.top - geom.bottom
@@ -232,9 +286,9 @@ function drawAxes(svg: SVGElement, chart: ChartDisplay, geom: ChartGeom): void {
   const slotW = plotW / cols
 
   // horizontal gridlines with value labels
-  const steps = 4
+  const steps = Math.max(1, Math.round(span / step))
   for (let i = 0; i <= steps; i++) {
-    const v = min + (span / steps) * i
+    const v = min + step * i
     const y = yOf(v)
     svgEl(svg, 'line', {
       x1: String(geom.left),
@@ -454,14 +508,34 @@ export function textboxBoxStyle(box: TextboxDisplay): string {
       )
     : null
   const waStyle = box.wordArtId ? WORDART_CSS[box.wordArtId] : undefined
+  // picture fill (photo boxes / a:blipFill): tiles repeat at natural size,
+  // stretch fills cover the whole box. Document data, hence inline.
+  const fillImage = box.fillImageDataUrl
+    ? `background-image:url("${box.fillImageDataUrl}");` +
+      (box.fillTile
+        ? 'background-repeat:repeat'
+        : 'background-repeat:no-repeat;background-size:100% 100%')
+    : ''
+  const transforms = [box.rotDeg ? `rotate(${box.rotDeg}deg)` : '']
+  const floatPos = box.floating
+    ? `position:absolute;left:${((box.offsetXEmu ?? 0) / 9525).toFixed(1)}px;` +
+      `top:${((box.offsetYEmu ?? 0) / 9525).toFixed(1)}px`
+    : ''
   return [
     geomCss ?? '',
-    !geomCss && box.fill ? `background:#${box.fill}` : '',
+    !geomCss && box.fill ? `background-color:#${box.fill}` : '',
     !geomCss && box.borderColor ? `border-color:#${box.borderColor}` : '',
+    !geomCss && box.borderColor && box.borderWidthPx ? `border-width:${box.borderWidthPx}px` : '',
+    !geomCss && box.borderColor && box.borderDash ? `border-style:${box.borderDash}` : '',
+    fillImage,
+    floatPos,
     box.widthPx ? `width:${box.widthPx}px` : '',
     // Word clips fixed-height (noAutofit) boxes instead of growing them
     box.heightPx ? `height:${box.heightPx}px` : '',
     `padding:${insetTop}px ${insetRight}px ${insetBottom}px ${insetLeft}px`,
+    transforms.filter(Boolean).length > 0
+      ? `transform:${transforms.filter(Boolean).join(' ')}`
+      : '',
     waStyle?.color ? `-webkit-text-fill-color:${waStyle.color}` : '',
     waStyle?.stroke ? `-webkit-text-stroke:${waStyle.stroke}` : '',
     waStyle?.textShadow ? `text-shadow:${waStyle.textShadow}` : '',
@@ -558,6 +632,69 @@ export function renderTextboxSpec(box: TextboxDisplay): DomSpec {
   return ['div', boxAttrs, ...paras]
 }
 
+/** Max explicit run size (half-points) when every run declares one (blockAttrs' strut rule). */
+function runStrutHalfPoints(runs: Run[]): number | null {
+  let max: number | null = null
+  for (const run of runs) {
+    if (run.sizeHalfPoints == null) return null
+    max = Math.max(max ?? 0, run.sizeHalfPoints)
+  }
+  return max
+}
+
+/** Per-paragraph --doc-line-factor from runs (Run[] port of extensions' paraLineFactor). */
+function runsLineFactor(runs: Run[], text: string): string {
+  const scriptVar = paraLineFactorCss(text)
+  if (!textHasCjk(text)) return scriptVar
+  let declaredMax = 0
+  let undeclaredCjk = false
+  for (const run of runs) {
+    if (!textHasCjk(run.text)) continue
+    const family = run.eaSlotEmpty === true ? null : (run.font ?? run.fontAscii)
+    if (family && isCjkFontName(family)) {
+      declaredMax = Math.max(declaredMax, lineHeightFactor(family))
+    } else undeclaredCjk = true
+  }
+  if (declaredMax <= 0) return scriptVar
+  return undeclaredCjk ? `max(${scriptVar}, ${declaredMax})` : String(declaredMax)
+}
+
+/**
+ * Cell paragraph block: run-size strut + line factor + explicit line spacing,
+ * mirroring the main renderer's blockAttrs. Without it the cell inherits
+ * .doc-page's line height as a computed px value (body font size), inflating
+ * every line whose runs are smaller. Block divs keep innerText's
+ * one-\n-per-paragraph semantics that cell edit write-back depends on.
+ */
+function cellParaSpec(
+  content: unknown[],
+  text: string,
+  runs: Run[] | null,
+  fmt?: TableParagraph,
+): DomSpec {
+  const styles: string[] = []
+  if (text) {
+    // Korean cells break at spaces like Word (same rule as the editor's blockAttrs)
+    if (textHasHangul(text)) styles.push('word-break:keep-all', 'overflow-wrap:anywhere')
+    styles.push(`--doc-line-factor:${runs ? runsLineFactor(runs, text) : paraLineFactorCss(text)}`)
+    const strut = runs ? runStrutHalfPoints(runs) : null
+    if (strut) styles.push(`--doc-strut:${strut / 2}pt`, 'font-size:min(var(--doc-strut), 1em)')
+  }
+  styles.push(
+    `line-height:${cssLineHeight(fmt?.lineRule, fmt?.lineRawTwips, fmt?.lineSpacing) ?? cssGridLineBase()}`,
+  )
+  if (fmt?.spaceBefore) styles.push(`margin-top:${cssGridSpacingPt(fmt.spaceBefore / 20)}`)
+  if (fmt?.spaceAfter) styles.push(`margin-bottom:${cssGridSpacingPt(fmt.spaceAfter / 20)}`)
+  // Word sizes an empty line by the paragraph mark / empty run (same as blockAttrs)
+  if (!text && fmt?.emptyRunSizeHalfPoints) {
+    styles.push(`font-size:${fmt.emptyRunSizeHalfPoints / 2}pt`)
+  }
+  const attrs: Record<string, string> = { style: styles.join(';') }
+  // empty paragraphs get the Latin factor (.doc-table .doc-p-empty) and a <br> line box
+  if (!text) attrs.class = 'doc-p-empty'
+  return content.length > 0 ? ['div', attrs, ...content] : ['div', attrs, ['br', {}]]
+}
+
 /** read-only <table> DOM spec from the display model (vMerge -> rowSpan) */
 export function renderTableSpec(model: TableModel): DomSpec {
   // grid positions per row (accounting for colSpan) so vertical merges line up
@@ -614,31 +751,26 @@ export function renderTableSpec(model: TableModel): DomSpec {
       if (style) tdAttrs.style = style
       if (cell.colSpan && cell.colSpan > 1) tdAttrs.colspan = String(cell.colSpan)
       if (rowSpan > 1) tdAttrs.rowspan = String(rowSpan)
-      // run-level styles preserved; <br> separators keep innerText \n-split
-      // semantics that nested-table edit write-back depends on
-      const paraBlocks: unknown[][] = cell.richParas?.length
-        ? cell.richParas.map((p) => [
-            ...runSpansWithPads(
-              p.runs.filter((run) => run.text !== ''),
-              p.autoSpace,
-            ),
-          ])
-        : cell.paras.map((p) => (p === '' ? [] : [...padSegments(p)]))
+      const paraBlocks: DomSpec[] = cell.richParas?.length
+        ? cell.richParas.map((p) => {
+            const runs = p.runs.filter((run) => run.text !== '')
+            return cellParaSpec(
+              runSpansWithPads(runs, p.autoSpace),
+              runs.map((r) => r.text).join(''),
+              runs,
+              p,
+            )
+          })
+        : cell.paras.map((p) => cellParaSpec(p === '' ? [] : [...padSegments(p)], p, null))
       // nested tables spliced in at their paragraph anchors (cells with them are never editable)
       const nested = cell.nestedTables ?? []
       const anchorOf = (i: number) =>
         Math.min(cell.nestedTableAnchors?.[i] ?? paraBlocks.length, paraBlocks.length)
       const content: unknown[] = []
       let ni = 0
-      let lastWasTable = false
       paraBlocks.forEach((blk, pi) => {
-        while (ni < nested.length && anchorOf(ni) <= pi) {
-          content.push(renderTableSpec(nested[ni++]))
-          lastWasTable = true
-        }
-        if (pi > 0 && !lastWasTable) content.push(['br', {}])
-        content.push(...blk)
-        lastWasTable = false
+        while (ni < nested.length && anchorOf(ni) <= pi) content.push(renderTableSpec(nested[ni++]))
+        content.push(blk)
       })
       while (ni < nested.length) content.push(renderTableSpec(nested[ni++]))
       if (content.length === 0) content.push('\u00a0')

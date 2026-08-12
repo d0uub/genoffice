@@ -7,7 +7,7 @@ import type {
   TableCell,
   TableModel,
 } from './types'
-import { escapeXmlAttr, escapeXmlText } from './xml-utils'
+import { escapeXmlAttr, escapeXmlText, textHasComplexScript } from './xml-utils'
 
 export interface GenerateContext {
   /** heading level -> styleId existing in the original styles.xml */
@@ -1011,6 +1011,10 @@ function formatPPrChildren(format: ParaFormat | undefined): PPrChild[] {
       xml: `<w:framePr w:dropCap="${type}" w:lines="${lines}" w:wrap="around" w:vAnchor="text" w:hAnchor="text"/>`,
     })
   }
+  if (format.emptyRunSizeHalfPoints) {
+    const sz = Math.round(format.emptyRunSizeHalfPoints)
+    out.push({ name: 'w:rPr', xml: `<w:rPr><w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr>` })
+  }
   return out
 }
 
@@ -1182,6 +1186,10 @@ function pprGroupUnchanged(tag: string, raw: string | undefined, f: ParaFormat):
       return rawTabsUnchanged(raw, f.tabStops ?? [])
     case 'w:framePr':
       return rawFramePrUnchanged(raw, f)
+    case 'w:rPr': {
+      const m = raw ? /<w:sz\b[^>]*w:val="(\d+)"/.exec(raw) : null
+      return (m ? parseInt(m[1], 10) : undefined) === f.emptyRunSizeHalfPoints
+    }
     default:
       return false
   }
@@ -1216,14 +1224,20 @@ export function mergePPrFormat(rawPPr: string, format: ParaFormat | undefined): 
   const managedTags = new Set(FORMAT_MANAGED_TAGS)
   if (format?.tabStops !== undefined) managedTags.add('w:tabs')
   if (format?.dropCap !== undefined) managedTags.add('w:framePr')
+  // only when the model carries a size: otherwise the paragraph-mark rPr stays unmanaged
+  if (format?.emptyRunSizeHalfPoints !== undefined) managedTags.add('w:rPr')
   const rawChildren = splitXmlChildren(inner)
   const rawOf = (tag: string) => rawChildren.find((c) => c.name === tag)?.xml
   const rebuilt = new Set(
     [...managedTags].filter((tag) => !pprGroupUnchanged(tag, rawOf(tag), format ?? {})),
   )
-  const freshOut = fresh.filter((c) => rebuilt.has(c.name))
-  const kept = rawChildren.filter((c) => !rebuilt.has(c.name))
   const rank = (n: string) => PPR_CHILD_ORDER.indexOf(n)
+  // the interleave below walks freshOut once with a monotonic index, so it has to arrive in
+  // schema order; formatPPrChildren emits by concern and leaves framePr and tabs until last
+  const freshOut = fresh
+    .filter((c) => rebuilt.has(c.name))
+    .sort((a, b) => rank(a.name) - rank(b.name))
+  const kept = rawChildren.filter((c) => !rebuilt.has(c.name))
   const parts: string[] = []
   let fi = 0
   let prevRank = -1
@@ -1489,14 +1503,16 @@ function tableCellXml(
         runs: text === '' ? [] : [{ text, bold: cell.bold, color: cell.color }],
       }))
   const paraXmls = paragraphs.map((paragraph) => {
-    const align = paragraph.align ?? cell.align
     const list = 'list' in paragraph ? paragraph.list : undefined
-    // schema order inside pPr: numPr before jc
     const numPr = list
       ? `<w:numPr><w:ilvl w:val="${list.ilvl}"/><w:numId w:val="${escapeXmlAttr(list.numId)}"/></w:numPr>`
       : ''
-    const jc = align ? `<w:jc w:val="${align === 'justify' ? 'both' : align}"/>` : ''
-    const pPr = numPr || jc ? `<w:pPr>${numPr}${jc}</w:pPr>` : ''
+    // no cell.align fallback here: it is a display aggregate of the paragraphs' own
+    // jc values, and writing it back would stamp w:jc into paragraphs that never had one
+    // (rich paragraphs carry their own align; the plain-paras fallback above sets it).
+    // The parsed format, not just w:jc: hand-building the pPr here dropped w:bidi and
+    // discarded every other paragraph property the model carries.
+    const pPr = mergePPrFormat(`<w:pPr>${numPr}</w:pPr>`, paragraph)
     return `<w:p>${pPr}${runsXml(paragraph.runs, null)}</w:p>`
   })
   // nested tables are regenerated from the model at their paragraph anchors (reverse
@@ -1957,6 +1973,7 @@ const RUN_MANAGED_GROUPS: Array<{ key: string; tags: string[] }> = [
   { key: 'size', tags: ['w:sz', 'w:szCs'] },
   { key: 'highlight', tags: ['w:highlight'] },
   { key: 'underline', tags: ['w:u'] },
+  { key: 'shading', tags: ['w:shd'] },
   { key: 'vertAlign', tags: ['w:vertAlign'] },
   { key: 'rPrChange', tags: ['w:rPrChange'] },
 ]
@@ -2014,6 +2031,10 @@ function revisionRPrChangeXml(run: Run): string | null {
   const props: string[] = []
   if (old.styleId) props.push(`<w:rStyle w:val="${escapeXmlAttr(old.styleId)}"/>`)
   if (old.font || old.fontAscii) props.push(freshRFontsXml(old.font, old.fontAscii))
+  // no Cs twins here: this nested w:rPr records what the run looked like before the tracked
+  // revision, and old.bold cannot tell w:b from w:b plus w:bCs. Adding them would invent a
+  // complex-script flag the document never had, so rejecting the revision would bold Arabic
+  // that was never bold.
   if (old.bold) props.push('<w:b/>')
   if (old.italic) props.push('<w:i/>')
   if (old.strike) props.push('<w:strike/>')
@@ -2043,8 +2064,14 @@ function modelRPrChildren(run: Run, insideLink: boolean): PPrChild[] {
   if (run.font || run.fontAscii) {
     out.push({ name: 'w:rFonts', xml: freshRFontsXml(run.font, run.fontAscii) })
   }
-  if (run.bold) out.push({ name: 'w:b', xml: '<w:b/>' })
-  if (run.italic) out.push({ name: 'w:i', xml: '<w:i/>' })
+  // the Cs twins carry the same flag for complex-script text; without them clicking Bold
+  // on Arabic or Hebrew changes nothing on screen, which is what Word writes too
+  if (run.bold) {
+    out.push({ name: 'w:b', xml: '<w:b/>' }, { name: 'w:bCs', xml: '<w:bCs/>' })
+  }
+  if (run.italic) {
+    out.push({ name: 'w:i', xml: '<w:i/>' }, { name: 'w:iCs', xml: '<w:iCs/>' })
+  }
   if (run.strike) out.push({ name: 'w:strike', xml: '<w:strike/>' })
   if (run.color)
     out.push({ name: 'w:color', xml: `<w:color w:val="${escapeXmlAttr(run.color)}"/>` })
@@ -2055,6 +2082,12 @@ function modelRPrChildren(run: Run, insideLink: boolean): PPrChild[] {
   if (run.highlight)
     out.push({ name: 'w:highlight', xml: `<w:highlight w:val="${escapeXmlAttr(run.highlight)}"/>` })
   if (run.underline) out.push({ name: 'w:u', xml: '<w:u w:val="single"/>' })
+  if (run.shading) {
+    out.push({
+      name: 'w:shd',
+      xml: `<w:shd w:val="clear" w:color="auto" w:fill="${escapeXmlAttr(run.shading)}"/>`,
+    })
+  }
   if (run.vertAlign)
     out.push({ name: 'w:vertAlign', xml: `<w:vertAlign w:val="${run.vertAlign}"/>` })
   const rPrChange = revisionRPrChangeXml(run)
@@ -2078,6 +2111,9 @@ export function mergeRPrModel(rawRPr: string, run: Run, insideLink: boolean): st
   const inner = rawRPr.slice(open.length, rawRPr.length - '</w:rPr>'.length)
   const rawChildren = splitXmlChildren(inner)
   const rawOf = (tag: string) => rawChildren.find((c) => c.name === tag)?.xml
+  // complex-script runs decode bold/italic/size from the Cs twins on the parse side;
+  // compare against the same elements or every untouched cs run would get "rebuilt"
+  const cs = run.cs ?? textHasComplexScript(run.text)
 
   // Compare model vs raw-encoded values group by group; equal → keep the original bytes
   // (drop the group from fresh)
@@ -2104,9 +2140,9 @@ export function mergeRPrModel(rawRPr: string, run: Run, insideLink: boolean): st
         return (rawAttr(attrs, 'w:eastAsia') ?? ascii) === run.font && ascii === run.fontAscii
       }
       case 'bold':
-        return rawBool(rawOf('w:b')) === !!run.bold
+        return rawBool(rawOf(cs ? 'w:bCs' : 'w:b')) === !!run.bold
       case 'italic':
-        return rawBool(rawOf('w:i')) === !!run.italic
+        return rawBool(rawOf(cs ? 'w:iCs' : 'w:i')) === !!run.italic
       case 'strike':
         return rawBool(rawOf('w:strike')) === !!run.strike
       case 'color': {
@@ -2114,12 +2150,16 @@ export function mergeRPrModel(rawRPr: string, run: Run, insideLink: boolean): st
         return (raw === 'auto' ? undefined : raw) === run.color
       }
       case 'size': {
-        const raw = rawAttr(rawOf('w:sz'), 'w:val')
+        const raw = rawAttr(rawOf(cs ? 'w:szCs' : 'w:sz'), 'w:val')
         return (raw ? parseInt(raw, 10) || undefined : undefined) === run.sizeHalfPoints
       }
       case 'highlight': {
         const raw = rawAttr(rawOf('w:highlight'), 'w:val')
         return (raw === 'none' ? undefined : raw) === run.highlight
+      }
+      case 'shading': {
+        const raw = rawAttr(rawOf('w:shd'), 'w:fill')
+        return (raw && raw !== 'auto' ? raw : undefined) === run.shading
       }
       case 'underline': {
         // w:u is not a boolean prop: no w:val (or val="none") means no

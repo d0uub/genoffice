@@ -82,6 +82,7 @@ describe('native editable tables', () => {
         type: 'docTextStyle',
         attrs: {
           color: '1F4E78',
+          eaSlotEmpty: null,
           sizeHalfPoints: null,
           font: 'Calibri',
           fontAscii: 'Calibri',
@@ -89,6 +90,7 @@ describe('native editable tables', () => {
           charSpacingTwips: null,
           charScaleEm: null,
           highlight: null,
+          shading: null,
           vertAlign: null,
           em: null,
           styleId: null,
@@ -209,7 +211,7 @@ describe('native editable tables', () => {
     editor.destroy()
   })
 
-  it('renders legacy over-wide grids clamped to the content box', async () => {
+  it('renders legacy over-wide grids clamped to the paper edge (content box + right margin)', async () => {
     const { editor } = await openTable()
     const table = editor.state.doc.firstChild!
     editor.view.dispatch(
@@ -225,7 +227,7 @@ describe('native editable tables', () => {
       Record<string, string>,
       [string, Record<string, string>, ...Array<[string, Record<string, string>]>],
     ]
-    expect(spec[1].style).toContain('width:min(1200px,100%)')
+    expect(spec[1].style).toContain('width:min(1200px,calc(100% + var(--doc-margin-right,0px)))')
     const cols = spec[2].slice(2) as Array<[string, Record<string, string>]>
     expect(cols.map((col) => col[1].style)).toEqual(['width:50.00%', 'width:50.00%'])
     editor.destroy()

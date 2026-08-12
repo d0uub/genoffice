@@ -8,7 +8,12 @@ import type {
 } from 'react'
 // legacy build: the modern build relies on new APIs like Math.sumPrecise that the current
 // Electron V8 lacks, making embedded font parsing fail and whole pages render as garbled raw char codes
-import { GlobalWorkerOptions, TextLayer, getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import {
+  AnnotationMode,
+  GlobalWorkerOptions,
+  TextLayer,
+  getDocument,
+} from 'pdfjs-dist/legacy/build/pdf.mjs'
 import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 import { AiPanel, GensparkMark } from './ai/AiPanel'
@@ -17,6 +22,8 @@ import {
   MARKUP_COLORS,
   geomDispSize,
   pdfRectToCss,
+  pdfToView,
+  quadSetsMatch,
   quadToRect,
   selectionQuadsByPage,
   viewToPdf,
@@ -26,8 +33,21 @@ import { groupLineSpans } from './text-line'
 import { DRAW_COLORS, DrawLayer, cssRgb } from './DrawLayer'
 import type { DrawTool, LocalDrawing } from './DrawLayer'
 import { FormLayer } from './FormLayer'
+import {
+  buildFormCatalog,
+  documentFormFeatures,
+  hasXfaMarker,
+  visibleFormWidgets,
+  type FormCatalog,
+  type FormField,
+  type FormWidget,
+} from './form-catalog'
 import { ImageEditLayer, imageRectKey } from './ImageEditLayer'
 import type { LocalImageEdit } from './ImageEditLayer'
+import { CropDialog, CutoutDialog } from './ImageDialogs'
+import { cropRect, flipPixels, multiplyAlpha } from './image-bake'
+import type { CropFractions } from './image-bake'
+import type { PixelImage } from './cutout'
 import { navAction } from './keyNav'
 import { rowOfVisIdx, spreadRows, stepPage } from './spread'
 import { LinkLayer } from './LinkLayer'
@@ -37,13 +57,26 @@ import { printPdf } from './print'
 import { PropertiesDialog } from './PropertiesDialog'
 import { SignatureDialog, fileToCanvas } from './SignatureDialog'
 import type { SignatureData } from './SignatureDialog'
+import { signatureDrawingForField } from './signature-field'
+import { ColorPalette } from './ColorPalette'
+import {
+  renderStaticFormMark,
+  renderStaticFormText,
+  type StaticFormFillKind,
+} from './static-form-fill'
 import { StampDialog } from './StampDialog'
 import { buildStamps } from './stamps'
 import type { HeaderFooterConfig, WatermarkConfig } from './stamps'
 import { buildSearchIndex, searchInIndex } from './search'
 import type { SearchIndex, SearchMatch } from './search'
 import { groupPageBlocks, type TextBlock } from './text-block'
-import { joinBlockLines, measurePt, wrapText } from './text-wrap'
+import {
+  joinBlockLines,
+  mapLineRangeToBlock,
+  measurePt,
+  spliceBlockText,
+  wrapText,
+} from './text-wrap'
 import {
   colorRunsEqual,
   colorSegments,
@@ -52,25 +85,39 @@ import {
   runsToColors,
   spliceCharColors,
 } from './color-runs'
+import { platformShortcuts } from '@genoffice/i18n'
 import { useI18n } from './i18n/locale'
 import { useAutosave } from './useAutosave'
 import { EDIT_FONTS } from '../shared/ipc'
 import type {
+  AnnotDeleteInput,
   DrawingInput,
   FormValueInput,
   ImageEditFailure,
+  ImageEditInput,
   ImageLayer,
   MarkupType,
   MetadataInput,
   PageImageRef,
+  StaticFormFillRecord,
   StampInput,
   TextEditFailure,
   TextEditInput,
+  TextEditValidation,
+  TextInsertFailure,
+  TextInsertInput,
 } from '../shared/ipc'
 
 const EDIT_FONT_BY_ID = new Map<string, (typeof EDIT_FONTS)[number]>(
   EDIT_FONTS.map((f) => [f.id, f]),
 )
+
+/** pdf.js AnnotationType codes for the markup subtypes we can delete */
+const MARKUP_TYPE_BY_ANNOT: Record<number, MarkupType> = {
+  9: 'highlight',
+  10: 'underline',
+  12: 'strikeout',
+}
 
 GlobalWorkerOptions.workerSrc = workerUrl
 
@@ -165,6 +212,7 @@ function PdfPage({
   scale,
   rotationDelta,
   visible,
+  onRenderState,
 }: {
   doc: PDFDocumentProxy
   pageNo: number
@@ -172,11 +220,26 @@ function PdfPage({
   /** Unsaved rotation delta (clockwise degrees) */
   rotationDelta: number
   visible: boolean
+  onRenderState: (doc: PDFDocumentProxy, pageNo: number, pending: boolean) => void
 }) {
   const holderRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const holder = holderRef.current
-    if (!visible || !holder) return
+    if (!holder) return
+    // Offscreen pages still release their bitmap. For an in-place rerender (save
+    // reload, zoom, rotation), keep the previous canvas visible until its replacement
+    // is fully rendered so the page never flashes white between document instances.
+    if (!visible) {
+      holder.replaceChildren()
+      // A page captured by the post-save barrier may scroll out before its replacement
+      // renders. Its overlays are no longer mounted, so treat the cleared offscreen page
+      // as settled instead of making the whole document wait for the timeout.
+      onRenderState(doc, pageNo, false)
+      return
+    }
+    // Visibility may change while a save reload is running. Register newly visible
+    // pages dynamically so global preview cleanup cannot outrun their bitmap swap.
+    onRenderState(doc, pageNo, true)
     let cancelled = false
     let renderTask: RenderTask | null = null
     void (async () => {
@@ -193,6 +256,9 @@ function PdfPage({
       renderTask = page.render({
         canvas,
         viewport,
+        // FormLayer renders interactive widgets as HTML. Exclude their saved appearance
+        // streams from the page bitmap or filled values are drawn twice after a reload.
+        annotationMode: AnnotationMode.ENABLE_FORMS,
         transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
       })
       try {
@@ -204,6 +270,9 @@ function PdfPage({
       const textDiv = document.createElement('div')
       textDiv.className = 'textLayer'
       holder.replaceChildren(canvas, textDiv)
+      // Notify after the bitmap swap, but before the browser paints. A post-save
+      // reload uses this to remove the matching edit previews in the same frame.
+      onRenderState(doc, pageNo, false)
       const textLayer = new TextLayer({
         textContentSource: page.streamTextContent(),
         container: textDiv,
@@ -218,27 +287,23 @@ function PdfPage({
     return () => {
       cancelled = true
       renderTask?.cancel()
-      holder.replaceChildren()
     }
-  }, [doc, pageNo, scale, rotationDelta, visible])
+  }, [doc, pageNo, scale, rotationDelta, visible, onRenderState])
   return <div ref={holderRef} className="pdf-page-content" />
 }
 
-/** Overlay for unsaved markups; click to select (deletion is explicit via the delete popup or Delete key) */
+/** Overlay for unsaved markups. Purely visual (pointer-events: none) so the text
+ *  underneath stays selectable; clicking is handled by the page-level hit test. */
 function MarkupOverlay({
   markups,
   geom,
   scale,
   selectedId,
-  selectTitle,
-  onSelect,
 }: {
   markups: LocalMarkup[]
   geom: PageGeom
   scale: number
   selectedId: string | null
-  selectTitle: string
-  onSelect: (id: string, x: number, y: number) => void
 }) {
   return (
     <>
@@ -258,8 +323,6 @@ function MarkupOverlay({
               key={`${m.id}-${i}`}
               className={`pdf-markup pdf-markup-${m.type}${m.id === selectedId ? ' pdf-markup-selected' : ''}`}
               style={style}
-              title={selectTitle}
-              onClick={(e) => onSelect(m.id, e.clientX, e.clientY)}
             />
           )
         }),
@@ -415,6 +478,39 @@ const IconSign = () => (
   <Icon>
     <path d="M5.5 15.1 C7.8 12.3 9.5 9 9.2 7 C9 5.7 7.9 5.9 7.6 7.4 C7.2 9.6 8.6 13.4 10.5 14.9 C12 16.1 13.9 15.3 14.7 13.8 C15.1 13 15.9 13 16.3 13.8 C16.7 14.7 17.7 15 18.5 14.4" />
     <path d="M4.75 18.6 L19.25 18.6" />
+  </Icon>
+)
+const IconPreviousField = () => (
+  <Icon>
+    <rect x="6" y="4.5" width="12" height="15" rx="1.5" />
+    <path d="M14.5 8 L10.5 12 L14.5 16" />
+  </Icon>
+)
+const IconNextField = () => (
+  <Icon>
+    <rect x="6" y="4.5" width="12" height="15" rx="1.5" />
+    <path d="M9.5 8 L13.5 12 L9.5 16" />
+  </Icon>
+)
+const IconCompleteForm = () => (
+  <Icon>
+    <rect x="4.5" y="5" width="15" height="14" rx="1.5" />
+    <path d="M8 12 L10.8 14.8 L16.5 9" />
+  </Icon>
+)
+const IconFormText = () => (
+  <Icon>
+    <path d="M5 6 H19 M12 6 V19 M8.5 19 H15.5" />
+  </Icon>
+)
+const IconFormCheck = () => (
+  <Icon>
+    <path d="M4.5 12.5 L9.5 17.5 L19.5 6.5" />
+  </Icon>
+)
+const IconFormCross = () => (
+  <Icon>
+    <path d="M6 6 L18 18 M18 6 L6 18" />
   </Icon>
 )
 const IconExportImg = () => (
@@ -634,6 +730,39 @@ const IconSwapImage = () => (
     <path d="M18.2 11.2 L20 13 L21.8 11.2" />
   </Icon>
 )
+const IconFlipH = () => (
+  <Icon size={14}>
+    <path d="M12 3.5 V20.5" strokeDasharray="2.6 2.2" />
+    <path d="M8.5 7 V17 L3.5 17 Z" />
+    <path d="M15.5 7 V17 L20.5 17 Z" />
+  </Icon>
+)
+const IconFlipV = () => (
+  <Icon size={14}>
+    <path d="M3.5 12 H20.5" strokeDasharray="2.6 2.2" />
+    <path d="M7 8.5 H17 L17 3.5 Z" />
+    <path d="M7 15.5 H17 L17 20.5 Z" />
+  </Icon>
+)
+const IconCrop = () => (
+  <Icon size={14}>
+    <path d="M7 3.5 V17 H20.5" />
+    <path d="M3.5 7 H17 V20.5" />
+  </Icon>
+)
+const IconCutout = () => (
+  <Icon size={14}>
+    <path d="M13.5 6.5 L17.5 10.5 L8 20 H4 V16 Z" />
+    <path d="M16 4 L20 8" />
+    <path d="M18.5 12.5 L19.4 14.6 L21.5 15.5 L19.4 16.4 L18.5 18.5 L17.6 16.4 L15.5 15.5 L17.6 14.6 Z" />
+  </Icon>
+)
+const IconOpacity = () => (
+  <Icon size={14}>
+    <path d="M12 3.5 C12 3.5 5.5 10 5.5 14.5 A6.5 6.5 0 0 0 18.5 14.5 C18.5 10 12 3.5 12 3.5 Z" />
+    <path d="M12 18.2 A3.7 3.7 0 0 1 8.3 14.5" />
+  </Icon>
+)
 
 const rgbToHex = (c: readonly [number, number, number]): string =>
   `#${c
@@ -658,6 +787,58 @@ const hexTo255 = (hex: string): [number, number, number] => [
 const rgb255ToHex = (c: readonly [number, number, number]): string =>
   `#${c.map((v) => v.toString(16).padStart(2, '0')).join('')}`
 
+const HIGHLIGHT_COLORS: { name: string; rgb: [number, number, number] }[] = [
+  { name: 'yellow', rgb: MARKUP_COLORS.highlight },
+  { name: 'orange', rgb: [1, 0.6, 0.2] },
+  { name: 'red', rgb: [1, 0.32, 0.32] },
+  { name: 'pink', rgb: [1, 0.45, 0.68] },
+  { name: 'purple', rgb: [0.68, 0.45, 0.95] },
+  { name: 'blue', rgb: [0.3, 0.68, 1] },
+  { name: 'cyan', rgb: [0.2, 0.82, 0.84] },
+  { name: 'teal', rgb: [0.12, 0.64, 0.56] },
+  { name: 'green', rgb: [0.35, 0.78, 0.42] },
+  { name: 'lime', rgb: [0.68, 0.82, 0.25] },
+  { name: 'gray', rgb: [0.62, 0.65, 0.7] },
+  { name: 'black', rgb: [0.16, 0.17, 0.2] },
+]
+const HIGHLIGHT_COLOR_PRESETS = HIGHLIGHT_COLORS.map((color) => ({
+  value: rgbToHex(color.rgb),
+  label: color.name,
+}))
+const DRAW_COLOR_PRESETS = DRAW_COLORS.map((color) => ({
+  value: rgbToHex(color.rgb),
+  label: color.name,
+}))
+
+const TEXT_COLOR_PRESETS = [
+  '#000000',
+  '#404040',
+  '#808080',
+  '#BFBFBF',
+  '#FFFFFF',
+  '#C62828',
+  '#E53935',
+  '#F4511E',
+  '#FB8C00',
+  '#FDD835',
+  '#7CB342',
+  '#22A75A',
+  '#00897B',
+  '#00ACC1',
+  '#1E88E5',
+  '#2B66FF',
+  '#3949AB',
+  '#7E57C2',
+  '#D81B60',
+  '#8D6E63',
+] as const
+const TEXT_COLOR_PICKER_PRESETS = TEXT_COLOR_PRESETS.map((value) => ({ value }))
+
+const rectsNear = (a: readonly number[], b: readonly number[], tolerance = 2): boolean =>
+  a.length === 4 &&
+  b.length === 4 &&
+  a.every((value, index) => Math.abs(value - b[index]!) <= tolerance)
+
 interface ThumbMenu {
   x: number
   y: number
@@ -680,7 +861,7 @@ const RIBBON_TABS = [
   { id: 'page', labelKey: 'ribbonTabPage' },
   { id: 'view', labelKey: 'ribbonTabView' },
 ] as const
-type RibbonTab = (typeof RIBBON_TABS)[number]['id']
+type RibbonTab = (typeof RIBBON_TABS)[number]['id'] | 'fillForm'
 
 /** One-click AI feature glyphs (same 24-canvas/1.5-stroke artwork as the docs ribbon) */
 const IconAiSummarize = () => (
@@ -740,6 +921,14 @@ interface LocalTextEdit {
   /** Matched run's ink bounds from validation (PDF user space). The edit rect is a pdf.js
       layout box; glyph ink can poke out of it, so the preview covers this instead */
   cover?: [number, number, number, number]
+  /** The run's base ink (display-only, from the draft's probe): the pending preview
+      shows the document's real color when the edit doesn't change it */
+  baseInk?: string
+}
+
+interface LocalTextInsert {
+  id: string
+  input: TextInsertInput
 }
 
 /** Area a pending edit must blank: the edit rect grown to the validated ink bounds */
@@ -781,12 +970,26 @@ interface TextDraft {
   /** Selection-level colors, one hex per code unit of value; '' = base (color ?? original).
       undefined/all-'' = uniform draft (the pre-existing single-color behavior). */
   charColors?: string[]
+  /** Colors the document already draws the run with (async, from the open probe),
+      pre-seeded into charColors. A commit whose colors still equal these carries
+      no color *change* — they only ride along so a rebuild repaints them. */
+  seedColorRuns?: { start: number; end: number; color: string }[]
+  /** The run's base ink in the document (async, from the open probe). Display-only:
+      the editor/preview text shows the real color; never committed as a change. */
+  seedInk?: string
   /** EDIT_FONTS id; undefined = automatic rebuild font */
   font?: string
   /** Style toggles; true = on, undefined = off (resolved via font variants at save) */
   bold?: true
   italic?: true
   editId?: string
+  /** Further pending edits folded into this block draft (besides editId); the
+      commit replaces editId and removes these — they would overlap the block
+      edit at save otherwise */
+  foldedIds?: string[]
+  /** The value the editor opened with when pending edits were folded in: an
+      unmodified commit must keep those edits instead of converting them */
+  foldBase?: string
   /** Ink bounds of the run being edited (async, from a dry-run validate) */
   cover?: [number, number, number, number]
   /** Present for paragraph (block) edits: the geometry the commit reflows into.
@@ -800,10 +1003,55 @@ interface TextDraft {
   }
 }
 
+/** Seed a fresh draft's colors from the open probe's report of what the document
+    already draws: the run's base ink (display-only) plus earlier saved selection
+    colors. Selection colors only while the draft is pristine — the runs are offsets
+    into oldText, and once typing starts they no longer align (the engine-side
+    rebuild still preserves the colors on save). */
+const seedDraftColors = (d: TextDraft, v: TextEditValidation): TextDraft => {
+  let next = d
+  // Near-white ink would vanish on the editor's white background; keep default ink
+  if (v.baseColor && !next.color && !next.seedInk) {
+    const [r, g, b] = v.baseColor
+    if ((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 <= 0.85)
+      next = { ...next, seedInk: rgb255ToHex(v.baseColor) }
+  }
+  if (!v.colorRuns || v.colorRuns.length === 0) return next
+  if (next.charColors || next.seedColorRuns || next.value !== next.oldText) return next
+  const hexRuns = v.colorRuns.map((r) => ({
+    start: r.start,
+    end: r.end,
+    color: rgb255ToHex(r.color),
+  }))
+  return {
+    ...next,
+    charColors: runsToColors(next.oldText.length, hexRuns),
+    seedColorRuns: hexRuns,
+  }
+}
+
+/** A markup annotation already saved in the file (read via pdf.js getAnnotations) */
+interface SavedMarkupAnnot {
+  pageIndex: number
+  /** PDF object number (pdf.js id "123R" → 123) */
+  objNum: number
+  type: MarkupType
+  quads: number[][]
+  rect: [number, number, number, number]
+}
+
+/** Pending deletion of a saved markup annotation */
+interface LocalAnnotDelete {
+  id: string
+  annot: SavedMarkupAnnot
+}
+
 interface EditSnapshot {
   markups: LocalMarkup[]
+  annotDeletes: LocalAnnotDelete[]
   drawings: LocalDrawing[]
   textEdits: LocalTextEdit[]
+  textInserts: LocalTextInsert[]
   imageEdits: LocalImageEdit[]
   stampCfg: StampConfig | null
   formEdits: Map<string, FormValueInput>
@@ -818,8 +1066,10 @@ interface EditSnapshot {
     while the write was in flight stays pending on the reloaded document. */
 interface SavedSnapshot {
   markupIds: Set<string>
+  annotDeleteIds: Set<string>
   drawingIds: Set<string>
   textEditIds: Set<string>
+  textInsertIds: Set<string>
   imageEditIds: Set<string>
   stampCfg: StampConfig | null
   formEdits: Map<string, FormValueInput>
@@ -831,7 +1081,13 @@ interface SavedSnapshot {
 
 /** Selected annotation with the anchor of its floating delete popup; a stamp click selects the whole watermark/header-footer set */
 type AnnotSelection =
-  | { kind: 'markup' | 'drawing' | 'textEdit' | 'imageEdit'; id: string; x: number; y: number }
+  | {
+      kind: 'markup' | 'drawing' | 'textEdit' | 'textInsert' | 'imageEdit'
+      id: string
+      x: number
+      y: number
+    }
+  | { kind: 'savedMarkup'; annot: SavedMarkupAnnot; x: number; y: number }
   | { kind: 'pageImage'; ref: PageImageRef; x: number; y: number }
   | { kind: 'stamp'; x: number; y: number }
 
@@ -860,6 +1116,7 @@ const signPlaceK = (sig: SignatureData, dispW: number, dispH: number): number =>
     (0.75 ≈ px→pt, so a screen-resolution image keeps its printed size) */
 const imagePlaceK = (sig: SignatureData, dispW: number, dispH: number): number =>
   Math.min(dispW / 2 / sig.width, dispH / 2 / sig.height, 0.75)
+const staticFormFillPlaceK = (): number => 1
 
 /** Click-to-place overlay: a translucent ghost of the pending signature follows the
     cursor at its actual landing size, and clicking drops it centered on that point */
@@ -891,7 +1148,7 @@ function SignDropOverlay({
   return (
     <div
       className="pdf-sign-drop"
-      title={title}
+      data-tip={title}
       onPointerMove={(e) => {
         const box = e.currentTarget.getBoundingClientRect()
         setPt([e.clientX - box.left, e.clientY - box.top])
@@ -999,11 +1256,39 @@ export default function App() {
   const [nightMode, setNightMode] = useState(false)
   const [outline, setOutline] = useState<OutlineNode[] | null>(null)
   const [markups, setMarkups] = useState<LocalMarkup[]>([])
+  /** Pending deletions of markup annotations already saved in the file */
+  const [annotDeletes, setAnnotDeletes] = useState<LocalAnnotDelete[]>([])
+  /** Saved markup annotations per original page index, loaded lazily for visible pages (keyed to `doc`) */
+  const [savedMarkups, setSavedMarkups] = useState<Map<number, SavedMarkupAnnot[]>>(new Map())
+  const [highlightColor, setHighlightColor] = useState<[number, number, number]>(
+    MARKUP_COLORS.highlight,
+  )
+  const [highlightColorOpen, setHighlightColorOpen] = useState(false)
   const [drawings, setDrawings] = useState<LocalDrawing[]>([])
   const [drawTool, setDrawTool] = useState<DrawTool | null>(null)
   const [textEdits, setTextEdits] = useState<LocalTextEdit[]>([])
+  const [textInserts, setTextInserts] = useState<LocalTextInsert[]>([])
+  const [pendingTextInsert, setPendingTextInsert] = useState<Omit<
+    TextInsertInput,
+    'pageIndex' | 'origin'
+  > | null>(null)
+  const [textInsertPointer, setTextInsertPointer] = useState<{
+    pageIndex: number
+    x: number
+    y: number
+  } | null>(null)
+  useEffect(() => {
+    if (!pendingTextInsert) setTextInsertPointer(null)
+  }, [pendingTextInsert])
   const [editTextMode, setEditTextMode] = useState(false)
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null)
+  const [textDraftColorOpen, setTextDraftColorOpen] = useState(false)
+  useEffect(() => {
+    if (!textDraft) setTextDraftColorOpen(false)
+  }, [textDraft])
+  /** Current draft for async callbacks (block-probe fallback runs after renders) */
+  const textDraftRef = useRef<TextDraft | null>(null)
+  textDraftRef.current = textDraft
   /** Hover affordance in edit-text mode: one box over the whole merged line */
   interface LineHover {
     origIdx: number
@@ -1096,9 +1381,31 @@ export default function App() {
   const [editImageMode, setEditImageMode] = useState(false)
   /** Existing content-stream images per page, listed while edit-image mode is on */
   const [pageImages, setPageImages] = useState<PageImageRef[]>([])
+  /** Baseline metadata loaded from the PDF; pending imageEdits carry any changes. */
+  const [savedStaticFormFills, setSavedStaticFormFills] = useState<StaticFormFillRecord[]>([])
   /** Picked image awaiting click-to-place (same overlay flow as signatures) */
   const [imagePick, setImagePick] = useState<Extract<SignatureData, { kind: 'image' }> | null>(null)
+  const [pendingStaticFill, setPendingStaticFill] = useState<StaticFormFillKind | null>(null)
+  const [staticTextDialog, setStaticTextDialog] = useState(false)
+  const [staticTextPurpose, setStaticTextPurpose] = useState<'form' | 'insert'>('form')
+  const [textInsertEditId, setTextInsertEditId] = useState<string | null>(null)
+  const [staticText, setStaticText] = useState('')
+  const [staticTextSize, setStaticTextSize] = useState(14)
+  const [staticTextColor, setStaticTextColor] = useState('#111111')
+  const [staticTextColorOpen, setStaticTextColorOpen] = useState(false)
+  const [staticTextAlign, setStaticTextAlign] = useState<'left' | 'center' | 'right'>('left')
+  useEffect(() => {
+    if (!staticTextDialog) setStaticTextColorOpen(false)
+  }, [staticTextDialog])
+  const [staticTextEditTarget, setStaticTextEditTarget] = useState<
+    | { kind: 'saved'; ref: PageImageRef; record: StaticFormFillRecord }
+    | { kind: 'pending'; editId: string; record: StaticFormFillRecord }
+    | null
+  >(null)
   const imageFileRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (!imagePick) setPendingStaticFill(null)
+  }, [imagePick])
   /** Edit-font ids available on this machine (loaded once; empty until then) */
   const [editFonts, setEditFonts] = useState<string[]>([])
   useEffect(() => {
@@ -1109,8 +1416,13 @@ export default function App() {
         /* dropdown simply stays at "original font" */
       })
   }, [])
-  /** Select-all runs once per opened draft; refocusing after a style-bar click must keep the caret */
+  /** Initial caret/selection placement runs once per opened draft; refocusing after a
+      style-bar click must keep the caret */
   const draftSelectedRef = useRef(false)
+  /** Range to select in the next opened draft (WPS-style unified model: a click carries
+      its caret as a collapsed range, a drag carries the dragged characters); null = the
+      position is unknown — the caret goes to the end */
+  const draftPreselectRef = useRef<[number, number] | null>(null)
   /** The open draft's textarea: style-bar color clicks read its selection (kept across blur) */
   const draftTaRef = useRef<HTMLTextAreaElement | null>(null)
   /** Colored mirror behind the transparent-text textarea; scroll-synced to it */
@@ -1133,13 +1445,30 @@ export default function App() {
   const [signDlg, setSignDlg] = useState(false)
   /** Confirmed signature awaiting placement; when non-null the page enters click-to-place mode */
   const [pendingSign, setPendingSign] = useState<SignatureData | null>(null)
+  /** A /Sig widget selected from the form layer; confirmed signatures fit this rect directly. */
+  const [signatureTarget, setSignatureTarget] = useState<FormWidget | null>(null)
   const [exporting, setExporting] = useState(false)
+  const [formCatalog, setFormCatalog] = useState<FormCatalog | null>(null)
+  const [formHasXfa, setFormHasXfa] = useState(false)
+  const [documentEncrypted, setDocumentEncrypted] = useState(false)
+  const [activeFormWidgetId, setActiveFormWidgetId] = useState<string | null>(null)
+  const formControlRefs = useRef<Map<string, HTMLElement>>(new Map())
   const [formEdits, setFormEdits] = useState<Map<string, FormValueInput>>(new Map())
   const [rotations, setRotations] = useState<Map<number, number>>(new Map())
   const [deleted, setDeleted] = useState<Set<number>>(new Set())
-  const [selPopup, setSelPopup] = useState<{ x: number; y: number } | null>(null)
+  /** Markup bar over the current selection; quads (PDF space, keyed by original page
+      index) drive the Word-style toggle state of the buttons */
+  const [selPopup, setSelPopup] = useState<{
+    x: number
+    y: number
+    quads: Map<number, number[][]>
+  } | null>(null)
   const [selected, setSelected] = useState<AnnotSelection | null>(null)
+  /** Transparency presets fold-out inside the image selection popup */
+  const [opacityMenu, setOpacityMenu] = useState(false)
+  useEffect(() => setOpacityMenu(false), [selected])
   const [deleteToast, setDeleteToast] = useState(false)
+  const [deletedInsertedText, setDeletedInsertedText] = useState(false)
   const toastTimerRef = useRef<number | null>(null)
   const [thumbMenu, setThumbMenu] = useState<ThumbMenu | null>(null)
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
@@ -1170,6 +1499,7 @@ export default function App() {
   const searchIndexRef = useRef<{ doc: PDFDocumentProxy; promise: Promise<SearchIndex> } | null>(
     null,
   )
+  const warnedXfaPathRef = useRef('')
   const searchJumpRef = useRef<{ matches: SearchMatch[]; cur: number } | null>(null)
 
   /** Visible pages (with unsaved reorder, deleted pages hidden): position → original page index */
@@ -1212,14 +1542,68 @@ export default function App() {
     sidebar === 'thumbs',
   )
 
+  // During a normal post-save reload, retain pending visual overlays until every
+  // currently rendered page has swapped to the new document bitmap. Resolving the
+  // barrier from PdfPage's render effect lets React clear those overlays before the
+  // browser paints, avoiding the old-canvas-without-preview flash.
+  const postSaveRenderWaitRef = useRef<{
+    doc: PDFDocumentProxy
+    pending: Set<number>
+    finishScheduled: boolean
+    finish: () => void
+  } | null>(null)
+  const pageRenderState = useCallback(
+    (renderedDoc: PDFDocumentProxy, pageNo: number, pending: boolean) => {
+      const wait = postSaveRenderWaitRef.current
+      if (!wait || wait.doc !== renderedDoc) return
+      if (pending) {
+        wait.pending.add(pageNo)
+        return
+      }
+      wait.pending.delete(pageNo)
+      // Defer completion until all effects from the current visibility update have
+      // reported. A page entering the viewport can then join before a departing page
+      // releases the last item from the previous snapshot.
+      if (wait.pending.size === 0 && !wait.finishScheduled) {
+        wait.finishScheduled = true
+        queueMicrotask(() => {
+          wait.finishScheduled = false
+          if (postSaveRenderWaitRef.current === wait && wait.pending.size === 0) wait.finish()
+        })
+      }
+    },
+    [],
+  )
+
   const loadDoc = useCallback(
-    async (path: string, previous: PDFDocumentProxy | null, saved?: SavedSnapshot) => {
+    async (
+      path: string,
+      previous: PDFDocumentProxy | null,
+      saved?: SavedSnapshot,
+      waitForPageNos: number[] = [],
+    ) => {
       const data = await window.pdfApi.readFile(path)
+      const bytes = new Uint8Array(data)
+      setFormHasXfa(hasXfaMarker(bytes))
+      if (!saved) {
+        setFormCatalog(null)
+        setSavedStaticFormFills([])
+        setActiveFormWidgetId(null)
+        formControlRefs.current.clear()
+      }
       const loaded = await getDocument({
-        data: new Uint8Array(data),
+        data: bytes,
         password: passwordRef.current,
         ...DOC_OPTS,
       }).promise
+      const metadata = await loaded.getMetadata()
+      const documentInfo = metadata.info as {
+        EncryptFilterName?: string | null
+        IsXFAPresent?: boolean
+      }
+      const formFeatures = documentFormFeatures(documentInfo, bytes)
+      setFormHasXfa(formFeatures.hasXfa)
+      setDocumentEncrypted(formFeatures.encrypted)
       const all: PageSize[] = []
       const rots: number[] = []
       for (let i = 1; i <= loaded.numPages; i++) {
@@ -1229,17 +1613,52 @@ export default function App() {
         all.push({ width: vp.width, height: vp.height })
         rots.push(page.rotate ?? 0)
       }
+      try {
+        setFormCatalog(await buildFormCatalog(loaded))
+      } catch {
+        setFormCatalog({ widgets: [], fields: new Map(), byPage: new Map() })
+      }
+      try {
+        setSavedStaticFormFills(await window.pdfApi.listStaticFormFills(path))
+      } catch {
+        setSavedStaticFormFills([])
+      }
       setSizes(all)
       setBaseRots(rots)
+      let renderedPages: Promise<void> | null = null
+      if (saved && waitForPageNos.length > 0) {
+        postSaveRenderWaitRef.current?.finish()
+        renderedPages = new Promise<void>((resolve) => {
+          const wait = {
+            doc: loaded,
+            pending: new Set(waitForPageNos.filter((pageNo) => pageNo <= loaded.numPages)),
+            finishScheduled: false,
+            finish: () => {},
+          }
+          const timer = window.setTimeout(() => wait.finish(), 2000)
+          wait.finish = () => {
+            window.clearTimeout(timer)
+            if (postSaveRenderWaitRef.current === wait) postSaveRenderWaitRef.current = null
+            resolve()
+          }
+          postSaveRenderWaitRef.current = wait
+          if (wait.pending.size === 0) wait.finish()
+        })
+      }
       setDoc(loaded)
+      if (renderedPages) await renderedPages
       if (!saved) {
         setMarkups([])
+        setAnnotDeletes([])
         setDrawings([])
         setTextEdits([])
+        setTextInserts([])
+        setPendingTextInsert(null)
         setImageEdits([])
         setTextDraft(null)
         setStampCfg(null)
         setFormEdits(new Map())
+        setSignatureTarget(null)
         setRotations(new Map())
         setDeleted(new Set())
         setOrder(null)
@@ -1254,6 +1673,16 @@ export default function App() {
             if (saved.markupIds.has(mk.id)) return []
             const ni = remap.get(mk.pageIndex)
             return ni === undefined ? [] : [ni === mk.pageIndex ? mk : { ...mk, pageIndex: ni }]
+          }),
+        )
+        setAnnotDeletes((prev) =>
+          prev.flatMap((d) => {
+            if (saved.annotDeleteIds.has(d.id)) return []
+            const ni = remap.get(d.annot.pageIndex)
+            if (ni === undefined) return []
+            // The object number may be stale after the rewrite; the save path's
+            // subtype+rect fallback still finds the annotation
+            return [ni === d.annot.pageIndex ? d : { ...d, annot: { ...d.annot, pageIndex: ni } }]
           }),
         )
         setDrawings((prev) =>
@@ -1273,6 +1702,18 @@ export default function App() {
             if (ni === undefined) return []
             return [
               ni === te.input.pageIndex ? te : { ...te, input: { ...te.input, pageIndex: ni } },
+            ]
+          }),
+        )
+        setTextInserts((prev) =>
+          prev.flatMap((insert) => {
+            if (saved.textInsertIds.has(insert.id)) return []
+            const ni = remap.get(insert.input.pageIndex)
+            if (ni === undefined) return []
+            return [
+              ni === insert.input.pageIndex
+                ? insert
+                : { ...insert, input: { ...insert.input, pageIndex: ni } },
             ]
           }),
         )
@@ -1382,8 +1823,18 @@ export default function App() {
     })()
   }, [openPath])
 
-  /** Documents opened with a password are treated as read-only: pdf-lib can't write back encrypted files */
-  const readOnly = status === 'ready' && passwordRef.current !== undefined
+  /** pdf-lib cannot write encrypted files, including owner-protected files that open without a password. */
+  const readOnly = status === 'ready' && (passwordRef.current !== undefined || documentEncrypted)
+
+  useEffect(() => {
+    if (
+      activeFormWidgetId &&
+      formCatalog &&
+      !formCatalog.widgets.some((widget) => widget.id === activeFormWidgetId)
+    ) {
+      setActiveFormWidgetId(null)
+    }
+  }, [activeFormWidgetId, formCatalog])
 
   const clampScale = (s: number) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s))
 
@@ -1458,6 +1909,70 @@ export default function App() {
     el.scrollTop = rowTop(rowOfVis(target - 1)) - PAGE_GAP / 2
   }
 
+  const formWidgets = visibleFormWidgets(formCatalog, visList)
+  const signedFormWidgetIds = useMemo(
+    () =>
+      new Set(
+        drawings.flatMap((drawing) =>
+          drawing.formWidgetId === undefined ? [] : [drawing.formWidgetId],
+        ),
+      ),
+    [drawings],
+  )
+  const hasFillableForm = formWidgets.length > 0
+  const activeFormIndex = formWidgets.findIndex((widget) => widget.id === activeFormWidgetId)
+
+  const registerFormControl = (id: string, element: HTMLElement | null) => {
+    if (element) formControlRefs.current.set(id, element)
+    else formControlRefs.current.delete(id)
+  }
+
+  const focusFormWidget = (widget: FormWidget) => {
+    const visibleIndex = visList.indexOf(widget.pageIndex)
+    if (visibleIndex < 0) return
+    setActiveFormWidgetId(widget.id)
+    scrollToPage(visibleIndex + 1)
+    setCurrentPage(visibleIndex + 1)
+    setPageInput(String(visibleIndex + 1))
+    let attempts = 0
+    const focusWhenMounted = () => {
+      const control = formControlRefs.current.get(widget.id)
+      if (control) {
+        control.focus()
+        return
+      }
+      if (attempts++ < 8) requestAnimationFrame(focusWhenMounted)
+    }
+    requestAnimationFrame(focusWhenMounted)
+  }
+
+  const stepFormWidget = (direction: 1 | -1) => {
+    if (formWidgets.length === 0) return
+    const current = activeFormIndex >= 0 ? activeFormIndex : direction === 1 ? -1 : 0
+    const next = (current + direction + formWidgets.length) % formWidgets.length
+    focusFormWidget(formWidgets[next]!)
+  }
+
+  const formFieldFilled = (field: FormField): boolean => {
+    const edit = formEdits.get(field.name)
+    if (field.kind === 'checkbox') return edit ? !!edit.checked : field.checked
+    // pdf.js deliberately hides the non-serializable /Sig value, and this app
+    // does not verify certificate signatures. A visual Ink/Stamp signature must
+    // therefore remain distinct from completion of a required digital-signature field.
+    if (field.kind === 'signature') return false
+    const value = edit && edit.kind !== 'checkbox' ? (edit.value ?? '') : field.value
+    return value.trim().length > 0
+  }
+
+  const visibleFormFieldNames = new Set(formWidgets.map((widget) => widget.fieldName))
+  const missingRequiredFields = [...(formCatalog?.fields.values() ?? [])].filter(
+    (field) =>
+      visibleFormFieldNames.has(field.name) &&
+      field.required &&
+      !field.readOnly &&
+      !formFieldFilled(field),
+  )
+
   /** Scale scroll position proportionally when zooming so the visual anchor doesn't jump */
   const applyScale = (next: number, mode: FitMode) => {
     fitModeRef.current = mode
@@ -1482,10 +1997,29 @@ export default function App() {
     else setPageInput(String(currentPage))
   }
 
+  const staticFormFills = useMemo(() => {
+    const records = new Map(savedStaticFormFills.map((record) => [record.id, record]))
+    for (const edit of imageEdits) {
+      if (!edit.staticFill) continue
+      if (edit.input.kind === 'deleteImage') {
+        records.delete(edit.staticFill.id)
+        continue
+      }
+      records.set(edit.staticFill.id, {
+        ...edit.staticFill,
+        pageIndex: edit.input.pageIndex,
+        rect: edit.input.rect,
+      })
+    }
+    return [...records.values()]
+  }, [imageEdits, savedStaticFormFills])
+
   const dirty =
     markups.length > 0 ||
+    annotDeletes.length > 0 ||
     drawings.length > 0 ||
     textEdits.length > 0 ||
+    textInserts.length > 0 ||
     imageEdits.length > 0 ||
     stampCfg !== null ||
     formEdits.size > 0 ||
@@ -1524,8 +2058,10 @@ export default function App() {
 
   const snapshot = (): EditSnapshot => ({
     markups,
+    annotDeletes,
     drawings,
     textEdits,
+    textInserts,
     imageEdits,
     stampCfg,
     formEdits,
@@ -1549,8 +2085,10 @@ export default function App() {
 
   const applySnapshot = (s: EditSnapshot) => {
     setMarkups(s.markups)
+    setAnnotDeletes(s.annotDeletes)
     setDrawings(s.drawings)
     setTextEdits(s.textEdits)
+    setTextInserts(s.textInserts)
     setImageEdits(s.imageEdits)
     setTextDraft(null)
     setStampCfg(s.stampCfg)
@@ -1626,6 +2164,67 @@ export default function App() {
     }
   }, [editTextMode, readOnly, doc, visibleRows, rows, pageBlocks, getSearchIndex])
 
+  /** Saved markup annotations are keyed to the loaded doc; drop them on save-reload */
+  useEffect(() => {
+    setSavedMarkups(new Map())
+  }, [doc])
+
+  /** Load saved markup annotations for pages scrolled into view, so clicking one can
+      select it for deletion. Settles the same way as the paragraph-box effect. */
+  useEffect(() => {
+    if (!doc || readOnly) return
+    const missing: number[] = []
+    for (const r of visibleRows)
+      for (const i of rows[r] ?? []) if (!savedMarkups.has(i)) missing.push(i)
+    if (missing.length === 0) return
+    let stale = false
+    void (async () => {
+      const entries: [number, SavedMarkupAnnot[]][] = []
+      for (const origIdx of missing) {
+        let list: SavedMarkupAnnot[] = []
+        try {
+          const page = await doc.getPage(origIdx + 1)
+          const annots = (await page.getAnnotations()) as {
+            id: string
+            annotationType: number
+            quadPoints?: Float32Array | null
+            rect: number[]
+          }[]
+          list = annots.flatMap((a) => {
+            const type = MARKUP_TYPE_BY_ANNOT[a.annotationType]
+            // Only ref-backed annots can be addressed for deletion (id "123R" → object 123)
+            const objNum = /^(\d+)R$/.exec(a.id)
+            if (!type || !objNum || !a.quadPoints || a.quadPoints.length < 8) return []
+            const quads: number[][] = []
+            for (let q = 0; q + 8 <= a.quadPoints.length; q += 8)
+              quads.push([...a.quadPoints.slice(q, q + 8)])
+            return [
+              {
+                pageIndex: origIdx,
+                objNum: Number(objNum[1]),
+                type,
+                quads,
+                rect: [a.rect[0]!, a.rect[1]!, a.rect[2]!, a.rect[3]!] as [
+                  number,
+                  number,
+                  number,
+                  number,
+                ],
+              },
+            ]
+          })
+        } catch {
+          /* page unreadable; no saved markups to offer */
+        }
+        entries.push([origIdx, list])
+      }
+      if (!stale) setSavedMarkups((prev) => new Map([...prev, ...entries]))
+    })()
+    return () => {
+      stale = true
+    }
+  }, [doc, readOnly, visibleRows, rows, savedMarkups])
+
   useEffect(() => {
     if (!searchOpen || !searchQuery.trim()) {
       setSearchMatches([])
@@ -1691,8 +2290,29 @@ export default function App() {
 
   const closeSearch = () => setSearchOpen(false)
 
+  /** Selection quads in PDF space keyed by original page index; null when nothing usable */
+  const selectionQuads = (): Map<number, number[][]> | null => {
+    const el = scrollRef.current
+    if (!el) return null
+    const byVisPage = selectionQuadsByPage(
+      el,
+      visList.map((i) => pageGeom(i)),
+      scale,
+    )
+    if (!byVisPage) return null
+    const quads = new Map<number, number[][]>()
+    for (const [visIdx, q] of byVisPage) {
+      const origIdx = visList[visIdx]
+      if (origIdx !== undefined) quads.set(origIdx, q)
+    }
+    return quads.size > 0 ? quads : null
+  }
+
   /** Mouse released over selected text → show the markup bar centered above the selection box (below if it doesn't fit) */
   const handleMouseUp = () => {
+    // In edit-text mode a drag means "choose the characters to edit" (the click
+    // after mouseup opens the editor preselected), not the markup popup
+    if (editTextMode && !readOnly) return
     setTimeout(() => {
       const el = scrollRef.current
       const sel = window.getSelection()
@@ -1704,40 +2324,93 @@ export default function App() {
       if (readOnly) return
       const box = sel.getRangeAt(0).getBoundingClientRect()
       if (box.width < 1 && box.height < 1) return
+      const quads = selectionQuads()
+      if (!quads) return
       setSelPopup({
         x: Math.min(Math.max(box.left + box.width / 2, 70), window.innerWidth - 70),
         y: box.top >= 52 ? box.top - 44 : Math.min(box.bottom + 8, window.innerHeight - 44),
+        quads,
       })
     }, 0)
   }
 
-  const applyMarkup = (type: MarkupType) => {
-    const el = scrollRef.current
-    if (!el || readOnly) return
-    const byVisPage = selectionQuadsByPage(
-      el,
-      visList.map((i) => pageGeom(i)),
-      scale,
+  /** The existing markup of `type` whose quads equal this page selection (tolerance-
+      based): pending unsaved markups first, then annotations saved in the file
+      (minus ones already pending deletion). Null = the selection isn't marked. */
+  const markupMatching = (
+    origIdx: number,
+    type: MarkupType,
+    quads: number[][],
+  ): { pending: LocalMarkup } | { saved: SavedMarkupAnnot } | null => {
+    const pending = markups.find(
+      (m) => m.pageIndex === origIdx && m.type === type && quadSetsMatch(m.quads, quads),
     )
-    setSelPopup(null)
-    if (!byVisPage) return
-    const added: LocalMarkup[] = []
-    for (const [visIdx, quads] of byVisPage) {
-      const origIdx = visList[visIdx]
-      if (origIdx === undefined) continue
-      added.push({
-        id: `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-        pageIndex: origIdx,
-        type,
-        color: MARKUP_COLORS[type],
-        quads,
-      })
+    if (pending) return { pending }
+    const pendingDeleted = new Set(annotDeletes.map((d) => d.annot.objNum))
+    const saved = (savedMarkups.get(origIdx) ?? []).find(
+      (a) => a.type === type && !pendingDeleted.has(a.objNum) && quadSetsMatch(a.quads, quads),
+    )
+    return saved ? { saved } : null
+  }
+
+  /** Word-style toggle: apply `type` to the selection, or remove it when the whole
+      selection already carries it. Selection and bar survive so more markup types can
+      be stacked/toggled on the same text; clicking anywhere else dismisses them. */
+  const applyMarkup = (type: MarkupType) => {
+    if (readOnly) return
+    const selQuads = selectionQuads()
+    if (!selQuads) {
+      setSelPopup(null)
+      return
     }
+    const matches = [...selQuads].map(
+      ([origIdx, quads]) => [origIdx, quads, markupMatching(origIdx, type, quads)] as const,
+    )
+    if (matches.every(([, , m]) => m !== null)) {
+      // Every page of the selection is already marked → the click removes
+      pushUndo()
+      const pendingIds = new Set(
+        matches.flatMap(([, , m]) => (m && 'pending' in m ? [m.pending.id] : [])),
+      )
+      const savedHits = matches.flatMap(([, , m]) => (m && 'saved' in m ? [m.saved] : []))
+      if (pendingIds.size > 0) setMarkups((prev) => prev.filter((m) => !pendingIds.has(m.id)))
+      if (savedHits.length > 0)
+        setAnnotDeletes((prev) => [...prev, ...savedHits.map((annot) => ({ id: newId(), annot }))])
+      return
+    }
+    // Pages already carrying the markup are skipped, not duplicated (Word semantics:
+    // applying to a partially-marked selection marks the rest)
+    const added: LocalMarkup[] = matches.flatMap(([origIdx, quads, m]) =>
+      m
+        ? []
+        : [
+            {
+              id: `m${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+              pageIndex: origIdx,
+              type,
+              color: type === 'highlight' ? highlightColor : MARKUP_COLORS[type],
+              quads,
+            },
+          ],
+    )
     if (added.length === 0) return
     pushUndo()
     setMarkups((prev) => [...prev, ...added])
-    window.getSelection()?.removeAllRanges()
   }
+
+  /** Markup types the whole current selection already carries — shown as pressed
+      buttons in the bar (clicking one removes the markup) */
+  const activeMarkupTypes = useMemo(() => {
+    const active = new Set<MarkupType>()
+    if (!selPopup) return active
+    for (const type of ['highlight', 'underline', 'strikeout'] as const) {
+      if ([...selPopup.quads].every(([origIdx, quads]) => markupMatching(origIdx, type, quads)))
+        active.add(type)
+    }
+    return active
+    // markupMatching reads markups/annotDeletes/savedMarkups; they are all listed
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selPopup, markups, annotDeletes, savedMarkups])
 
   // ── Annotation selection: click selects, deletion is explicit (delete popup / Delete key) ──
 
@@ -1746,6 +2419,46 @@ export default function App() {
     x: Math.min(Math.max(x, 70), window.innerWidth - 70),
     y: y >= 96 ? y - 48 : Math.min(y + 12, window.innerHeight - 44),
   })
+
+  /** Markup overlays don't take pointer events (text under them must stay selectable),
+   *  so a bare click on the page content hit-tests them here. Only a true click counts:
+   *  a drag that produced a text selection goes to the markup bar instead. Pending
+   *  (unsaved) markups win over saved annotations; last added wins within each group,
+   *  matching visual stacking order. */
+  const handlePageClick = (origIdx: number, e: ReactMouseEvent<HTMLDivElement>) => {
+    // Only clicks that land on the rendered page (canvas/text layer); overlays like
+    // draw shapes, note pins, stamps and previews handle their own selection
+    if (!(e.target as Element).closest?.('.pdf-page-content')) return
+    const sel = window.getSelection()
+    if (sel && !sel.isCollapsed) return
+    const box = e.currentTarget.getBoundingClientRect()
+    const g = pageGeom(origIdx)
+    const [px, py] = viewToPdf(g, (e.clientX - box.left) / scale, (e.clientY - box.top) / scale)
+    const hitQuads = (quads: number[][]) =>
+      quads.some((q) => {
+        const r = quadToRect(q)
+        return px >= r[0] && px <= r[2] && py >= r[1] && py <= r[3]
+      })
+    const select = (selection: AnnotSelection) => {
+      e.stopPropagation() // keep the scroll container from clearing the selection we just set
+      setSelected(selection)
+    }
+    const at = popupPos(e.clientX, e.clientY)
+    const onPage = markups.filter((m) => m.pageIndex === origIdx)
+    for (let i = onPage.length - 1; i >= 0; i--) {
+      const m = onPage[i]!
+      if (hitQuads(m.quads)) return select({ kind: 'markup', id: m.id, ...at })
+    }
+    if (readOnly) return
+    // Markup annotations already saved in the file (skipping ones pending deletion)
+    const pendingDeleted = new Set(annotDeletes.map((d) => d.annot.objNum))
+    const saved = savedMarkups.get(origIdx) ?? []
+    for (let i = saved.length - 1; i >= 0; i--) {
+      const a = saved[i]!
+      if (pendingDeleted.has(a.objNum) || !hitQuads(a.quads)) continue
+      return select({ kind: 'savedMarkup', annot: a, ...at })
+    }
+  }
 
   /** Shift a drawing by a PDF-space delta (drag-to-move on the page) */
   const moveDrawing = (id: string, dx: number, dy: number) => {
@@ -1808,20 +2521,89 @@ export default function App() {
 
   // ── Text editing (content-stream replacement, applied by the main process at save) ──
 
+  /** Style-free line edit: the only kind that can fold into a paragraph draft
+      (style overrides are scoped to the edited line, a block commit is paragraph-wide) */
+  const isPlainLineEdit = (i: TextEditInput) =>
+    i.origin === undefined &&
+    i.newFontSize === undefined &&
+    i.newColor === undefined &&
+    i.newFont === undefined &&
+    !i.newBold &&
+    !i.newItalic &&
+    !(i.colorRuns && i.colorRuns.length > 0)
+
+  /** Pending line edits inside `block` folded into its paragraph text. Opening the
+      paragraph over them with the original text would hide the user's changes, and
+      committing would create a second edit over the same objects — skipped at save
+      as overlapping. null = nothing to fold or some pending edit inside the block
+      cannot fold (callers keep their previous behavior then). */
+  const foldBlockValue = (
+    origIdx: number,
+    block: TextBlock,
+    blockText: string,
+  ): { value: string; editId: string; foldedIds: string[] } | null => {
+    const inside = textEdits.filter((e) => {
+      if (e.input.pageIndex !== origIdx) return false
+      const r = e.input.rect
+      const cx = (r[0] + r[2]) / 2
+      const cy = (r[1] + r[3]) / 2
+      return (
+        cx >= block.rect[0] && cx <= block.rect[2] && cy >= block.rect[1] && cy <= block.rect[3]
+      )
+    })
+    if (inside.length === 0) return null
+    if (!inside.every((e) => isPlainLineEdit(e.input))) return null
+    // Non-space offset of each block line inside blockText, to disambiguate a
+    // repeated oldText toward the line the edit actually sits on
+    const offsets: number[] = []
+    let acc = 0
+    for (const l of block.lines) {
+      offsets.push(acc)
+      acc += l.text.replace(/\s+/g, '').length
+    }
+    const folded = spliceBlockText(
+      blockText,
+      inside.map((e) => {
+        const cy = (e.input.rect[1] + e.input.rect[3]) / 2
+        const li = block.lines.findIndex((l) => cy >= l.rect[1] && cy <= l.rect[3])
+        return { oldText: e.input.oldText, newText: e.input.newText, hint: offsets[li] ?? 0 }
+      }),
+    )
+    if (folded === null) return null
+    return { value: folded, editId: inside[0]!.id, foldedIds: inside.slice(1).map((e) => e.id) }
+  }
+
   /** Open the paragraph-sized editor over a clustered block: the whole block is the
-      edit unit and the commit reflows the text within the block width */
-  const startBlockEdit = (origIdx: number, block: TextBlock) => {
+      edit unit and the commit reflows the text within the block width. Pending plain
+      line edits inside the block fold into the draft (the commit then replaces them).
+      `fallbackSpan` is the text-layer span under the click: when the dry-run probe
+      reports the block cannot be located as one unit (clustering misfires on table
+      layouts — vertically stacked cells read as a "paragraph"), committing could only
+      ever fail with textEditNoMatch, so degrade to the line-level editor for that
+      span instead. */
+  const startBlockEdit = (
+    origIdx: number,
+    block: TextBlock,
+    fallbackSpan?: HTMLElement,
+    preselect?: [number, number],
+  ) => {
     const oldText = joinBlockLines(block.lines.map((l) => l.text))
     if (!oldText.trim()) return
     const rect: [number, number, number, number] = [...block.rect]
+    const fold = foldBlockValue(origIdx, block, oldText)
     setSelected(null)
     draftSelectedRef.current = false
+    // Preselect offsets are into oldText; folded pending edits shift them
+    draftPreselectRef.current = preselect && (fold?.value ?? oldText) === oldText ? preselect : null
     setTextDraft({
       origIdx,
       rect,
       oldText,
       fontSize: block.fontSize,
-      value: oldText,
+      value: fold?.value ?? oldText,
+      editId: fold?.editId,
+      foldedIds: fold && fold.foldedIds.length > 0 ? fold.foldedIds : undefined,
+      foldBase: fold?.value,
       block: {
         leftPt: block.rect[0],
         firstBaseline: block.lines[0]!.y,
@@ -1841,12 +2623,25 @@ export default function App() {
       void window.pdfApi
         .validateTextEdits({ path: filePath, edits: [probe] })
         .then(([v]) => {
-          if (!v?.bounds) return
-          setTextDraft((d) =>
-            d && !d.editId && d.origIdx === origIdx && d.rect === rect
-              ? { ...d, cover: v.bounds }
-              : d,
-          )
+          if (!v) return
+          if (v.reason) {
+            // Only swap editors while the draft is untouched — yanking typed text
+            // would be worse than the commit-time notice. rect identity pins the
+            // draft this probe belongs to (folded drafts carry an editId).
+            const d = textDraftRef.current
+            if (!d || d.origIdx !== origIdx || d.rect !== rect) return
+            if (d.value !== (d.foldBase ?? d.oldText)) return
+            setTextDraft(null)
+            if (fallbackSpan?.isConnected) openLineEdit(origIdx, fallbackSpan)
+            return
+          }
+          setTextDraft((d) => {
+            if (!d || d.origIdx !== origIdx || d.rect !== rect) return d
+            let next = d
+            if (v.bounds) next = { ...next, cover: v.bounds }
+            next = seedDraftColors(next, v)
+            return next
+          })
         })
         .catch(() => {
           /* cover falls back to the block rect */
@@ -1854,8 +2649,94 @@ export default function App() {
     }
   }
 
+  /** A drag over page text in edit mode (WPS-style) opens the editor with exactly the
+      dragged characters selected: typing replaces just them, a swatch colors just them.
+      Runs off the click that follows the drag's mouseup; returns true when consumed. */
+  const dragEditFromSelection = (origIdx: number, e: ReactMouseEvent<HTMLDivElement>): boolean => {
+    const sel = window.getSelection()
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false
+    const range = sel.getRangeAt(0)
+    const layer = e.currentTarget.querySelector('.textLayer')
+    if (!layer) return false
+    const spanOf = (node: Node): HTMLElement | null => {
+      const el = node instanceof Element ? node : node.parentElement
+      const span = el?.closest('.textLayer span')
+      return span instanceof HTMLElement && layer.contains(span) ? span : null
+    }
+    const offsetIn = (span: HTMLElement, node: Node, off: number) =>
+      node === span ? (off === 0 ? 0 : (span.textContent ?? '').length) : off
+    const startSpan = spanOf(range.startContainer)
+    const endSpan = spanOf(range.endContainer)
+    if (!startSpan || !endSpan) return false
+    const gs = groupLineSpans(startSpan)
+    const ge = gs.spans.includes(endSpan) ? gs : groupLineSpans(endSpan)
+    const si = gs.spans.indexOf(startSpan)
+    const ei = ge.spans.indexOf(endSpan)
+    if (si < 0 || ei < 0 || !gs.text.trim()) return false
+    const rawS = gs.starts[si]! + offsetIn(startSpan, range.startContainer, range.startOffset)
+    const rawE = ge.starts[ei]! + offsetIn(endSpan, range.endContainer, range.endOffset)
+    // The block under the drag's start (same lookup as plain clicks)
+    const pageBox = e.currentTarget.getBoundingClientRect()
+    const sr = startSpan.getBoundingClientRect()
+    const [px, py] = viewToPdf(
+      pageGeom(origIdx),
+      (sr.left + sr.width / 2 - pageBox.left) / scale,
+      (sr.top + sr.height / 2 - pageBox.top) / scale,
+    )
+    const block = pageBlocks
+      .get(origIdx)
+      ?.find((b) => px >= b.rect[0] && px <= b.rect[2] && py >= b.rect[1] && py <= b.rect[3])
+    if (block && block.lines.length > 1) {
+      const blockText = joinBlockLines(block.lines.map((l) => l.text))
+      // Cross-line drags map each endpoint through its own visual line
+      const pre =
+        gs === ge
+          ? mapLineRangeToBlock(blockText, gs.text, Math.min(rawS, rawE), Math.max(rawS, rawE))
+          : (() => {
+              const a = mapLineRangeToBlock(blockText, gs.text, rawS, gs.text.length)
+              const b = mapLineRangeToBlock(blockText, ge.text, 0, rawE)
+              return a && b
+                ? ([Math.min(a[0], b[0]), Math.max(a[1], b[1])] as [number, number])
+                : null
+            })()
+      sel.removeAllRanges()
+      startBlockEdit(origIdx, block, startSpan, pre ?? undefined)
+      return true
+    }
+    const pre: [number, number] =
+      gs === ge ? [Math.min(rawS, rawE), Math.max(rawS, rawE)] : [rawS, gs.text.length]
+    sel.removeAllRanges()
+    openLineEdit(origIdx, startSpan, pre)
+    return true
+  }
+
+  /** Caret of a click on page text: the span under the point plus the click's
+      code-unit offset inside its visual line. Unified selection model: a click is a
+      zero-length drag, so it carries a collapsed preselect into the opened editor. */
+  const caretFromPoint = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const layer = e.currentTarget.querySelector('.textLayer')
+    const r = document.caretRangeFromPoint(e.clientX, e.clientY)
+    if (!layer || !r) return null
+    const el =
+      r.startContainer instanceof Element ? r.startContainer : r.startContainer.parentElement
+    const span = el?.closest('.textLayer span')
+    if (!(span instanceof HTMLElement) || !layer.contains(span)) return null
+    const group = groupLineSpans(span)
+    const i = group.spans.indexOf(span)
+    if (i < 0) return null
+    const off =
+      r.startContainer === span ? 0 : Math.min(r.startOffset, (span.textContent ?? '').length)
+    return { span, group, raw: group.starts[i]! + off }
+  }
+
   /** Click on a text-layer span in edit mode → open the floating editor over that run */
   const startTextEdit = (origIdx: number, e: ReactMouseEvent<HTMLDivElement>) => {
+    if (!readOnly && dragEditFromSelection(origIdx, e)) {
+      e.stopPropagation()
+      return
+    }
+    const span = (e.target as HTMLElement).closest('.textLayer span')
+    const caret = caretFromPoint(e)
     // A plain click inside a multi-line clustered block edits the paragraph
     // (WPS-style); Alt+click keeps the line-level editor as the fallback for
     // clustering misfires. Single-line blocks stay on the line path.
@@ -1873,21 +2754,37 @@ export default function App() {
         )
         if (block && block.lines.length > 1) {
           e.stopPropagation()
-          startBlockEdit(origIdx, block)
+          const pre = caret
+            ? (mapLineRangeToBlock(
+                joinBlockLines(block.lines.map((l) => l.text)),
+                caret.group.text,
+                caret.raw,
+                caret.raw,
+              ) ?? undefined)
+            : undefined
+          startBlockEdit(origIdx, block, span instanceof HTMLElement ? span : undefined, pre)
           return
         }
       }
     }
-    const span = (e.target as HTMLElement).closest('.textLayer span')
-    if (!(span instanceof HTMLElement)) return
-    if (!(span.textContent ?? '').trim()) return
+    const anchor = caret?.span ?? (span instanceof HTMLElement ? span : null)
+    if (!anchor) return
+    if (!(anchor.textContent ?? '').trim()) return
+    e.stopPropagation()
+    openLineEdit(origIdx, anchor, caret ? [caret.raw, caret.raw] : undefined)
+  }
+
+  /** Open the line-level floating editor over the visual line containing `span`.
+      Reads live client rects, so it also serves the async block-probe fallback. */
+  const openLineEdit = (origIdx: number, span: HTMLElement, preselect?: [number, number]) => {
+    const pageEl = span.closest('.pdf-page')
+    if (!pageEl) return
     // Edit the whole visual line, not the clicked pdf.js run (CJK is often one span
     // per glyph); the save-side matcher aggregates the covered text objects anyway
     const lineGroup = groupLineSpans(span)
     const oldText = lineGroup.text
     if (!oldText.trim()) return
-    e.stopPropagation()
-    const pageBox = e.currentTarget.getBoundingClientRect()
+    const pageBox = pageEl.getBoundingClientRect()
     const sb = lineGroup.rect
     const geom = pageGeom(origIdx)
     const [ax, ay] = viewToPdf(
@@ -1911,6 +2808,7 @@ export default function App() {
       unionH > 0 ? Math.abs(by - ay) * (lineGroup.fontHeight / unionH) : Math.abs(by - ay)
     setSelected(null)
     draftSelectedRef.current = false
+    draftPreselectRef.current = preselect ?? null
     setTextDraft({ origIdx, rect, oldText, fontSize, value: oldText })
     // The span rect is a font-metric layout box; the run's glyph ink can poke out of it.
     // Fetch the engine's real ink bounds so the editor/preview cover hides the old run fully.
@@ -1925,12 +2823,26 @@ export default function App() {
       void window.pdfApi
         .validateTextEdits({ path: filePath, edits: [probe] })
         .then(([v]) => {
-          if (!v?.bounds) return
-          setTextDraft((d) =>
-            d && !d.editId && d.origIdx === origIdx && d.rect === rect
-              ? { ...d, cover: v.bounds }
-              : d,
-          )
+          if (!v) return
+          if (v.reason) {
+            // The engine cannot locate this line: close the untouched draft with the
+            // notice now instead of letting the user edit and fail at commit time.
+            // A draft the user already typed into stays open (yanking typed text
+            // would be worse) — the commit-time validation still reports it.
+            const d = textDraftRef.current
+            if (!d || d.editId || d.origIdx !== origIdx || d.rect !== rect) return
+            if (d.value !== d.oldText) return
+            setTextDraft(null)
+            showNotice(t('textEditNoMatch'))
+            return
+          }
+          setTextDraft((d) => {
+            if (!d || d.editId || d.origIdx !== origIdx || d.rect !== rect) return d
+            let next = d
+            if (v.bounds) next = { ...next, cover: v.bounds }
+            next = seedDraftColors(next, v)
+            return next
+          })
         })
         .catch(() => {
           /* cover falls back to the span rect */
@@ -2008,11 +2920,33 @@ export default function App() {
     const prevFont = existing?.input.newFont
     const prevBold = existing?.input.newBold ? true : undefined
     const prevItalic = existing?.input.newItalic ? true : undefined
-    const prevRuns = (existing?.input.colorRuns ?? []).map((r) => ({
-      start: r.start,
-      end: r.end,
-      color: rgb255ToHex(r.color),
-    }))
+    // Baseline for "did the colors change": the pending edit's committed runs
+    // (newText offsets, same space as hexRuns), or — for a fresh draft — the
+    // document's own colors the probe seeded (oldText offsets: compare in draft
+    // space, the wrap may shift words and move newText offsets without any
+    // color changing). Seeded colors alone are not a change — they only ride
+    // along so a rebuild repaints them.
+    const prevRuns = existing
+      ? (existing.input.colorRuns ?? []).map((r) => ({
+          start: r.start,
+          end: r.end,
+          color: rgb255ToHex(r.color),
+        }))
+      : (d.seedColorRuns ?? [])
+    const cmpRuns = existing ? hexRuns : draftColors ? colorsToRuns(draftColors) : []
+    // Folded paragraph draft committed untouched: keep the folded line edits as
+    // they are instead of converting them into a whole-paragraph rebuild
+    if (
+      d.foldBase !== undefined &&
+      d.value === d.foldBase &&
+      d.size === undefined &&
+      d.color === undefined &&
+      d.font === undefined &&
+      d.bold === undefined &&
+      d.italic === undefined &&
+      !draftColors
+    )
+      return null
     if (
       cmpValue === prevValue &&
       d.size === prevSize &&
@@ -2020,9 +2954,13 @@ export default function App() {
       d.font === prevFont &&
       d.bold === prevBold &&
       d.italic === prevItalic &&
-      colorRunsEqual(hexRuns, prevRuns)
+      colorRunsEqual(cmpRuns, prevRuns)
     )
       return null
+    const dropFolded = (list: LocalTextEdit[]) =>
+      d.foldedIds && d.foldedIds.length > 0
+        ? list.filter((e) => !d.foldedIds!.includes(e.id))
+        : list
     if (
       d.value === d.oldText &&
       d.size === undefined &&
@@ -2032,13 +2970,13 @@ export default function App() {
       d.italic === undefined &&
       hexRuns.length === 0
     ) {
-      // Reverted back to the original — the pending edit is moot
-      return edits.filter((e) => e.id !== d.editId)
+      // Reverted back to the original — the pending edit(s) are moot
+      return dropFolded(edits.filter((e) => e.id !== d.editId))
     }
     // A blank replacement would erase the run from the page. Edit mode doesn't offer
     // deletion, so a stray Enter in the emptied box means "never mind", not "wipe it"
     if (d.value.trim() === '') {
-      return d.editId ? edits.filter((e) => e.id !== d.editId) : null
+      return d.editId ? dropFolded(edits.filter((e) => e.id !== d.editId)) : null
     }
     const input: TextEditInput = {
       pageIndex: d.origIdx,
@@ -2059,8 +2997,12 @@ export default function App() {
       blockSource: d.block ? d.value : undefined,
     }
     return d.editId
-      ? edits.map((e) => (e.id === d.editId ? { ...e, input, cover: d.cover ?? e.cover } : e))
-      : [...edits, { id: newId(), input, cover: d.cover }]
+      ? dropFolded(edits).map((e) =>
+          e.id === d.editId
+            ? { ...e, input, cover: d.cover ?? e.cover, baseInk: d.seedInk ?? e.baseInk }
+            : e,
+        )
+      : [...edits, { id: newId(), input, cover: d.cover, baseInk: d.seedInk }]
   }
 
   /** Current pending text edits for async callbacks (validation results land after renders) */
@@ -2111,9 +3053,34 @@ export default function App() {
     if (!sel) return
     pushUndo()
     if (sel.kind === 'markup') setMarkups((prev) => prev.filter((m) => m.id !== sel.id))
+    else if (sel.kind === 'savedMarkup')
+      setAnnotDeletes((prev) => [...prev, { id: newId(), annot: sel.annot }])
     else if (sel.kind === 'drawing') setDrawings((prev) => prev.filter((d) => d.id !== sel.id))
     else if (sel.kind === 'textEdit') setTextEdits((prev) => prev.filter((e) => e.id !== sel.id))
-    else if (sel.kind === 'imageEdit') setImageEdits((prev) => prev.filter((e) => e.id !== sel.id))
+    else if (sel.kind === 'textInsert')
+      setTextInserts((prev) => prev.filter((insert) => insert.id !== sel.id))
+    else if (sel.kind === 'imageEdit')
+      setImageEdits((prev) =>
+        prev.flatMap((edit) => {
+          if (edit.id !== sel.id) return [edit]
+          if (
+            edit.staticFill &&
+            (edit.input.kind === 'transformImage' || edit.input.kind === 'replaceImage')
+          ) {
+            return [
+              {
+                ...edit,
+                input: {
+                  kind: 'deleteImage' as const,
+                  pageIndex: edit.input.pageIndex,
+                  oldRect: edit.input.oldRect,
+                },
+              },
+            ]
+          }
+          return []
+        }),
+      )
     else if (sel.kind === 'pageImage')
       // Deleting an untouched existing image = a pending delete op
       setImageEdits((prev) => [
@@ -2121,12 +3088,14 @@ export default function App() {
         {
           id: newId(),
           input: { kind: 'deleteImage', pageIndex: sel.ref.pageIndex, oldRect: sel.ref.rect },
+          staticFill: savedStaticFillForRef(sel.ref),
         },
       ])
     else setStampCfg(null)
     setSelected(null)
     // Transient "deleted · undo" toast so the removal is visible and reversible in place
     if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
+    setDeletedInsertedText(sel.kind === 'textInsert')
     setDeleteToast(true)
     toastTimerRef.current = window.setTimeout(() => setDeleteToast(false), 5000)
   }
@@ -2137,6 +3106,12 @@ export default function App() {
     setNotice(msg)
     noticeTimerRef.current = window.setTimeout(() => setNotice(null), 8000)
   }
+
+  useEffect(() => {
+    if (!formHasXfa || !filePath || warnedXfaPathRef.current === filePath) return
+    warnedXfaPathRef.current = filePath
+    showNotice(t('formXfaWarning'))
+  }, [filePath, formHasXfa])
 
   /** Localize known structured main-process errors; other messages pass through raw */
   const friendlySaveError = (error: string): string => {
@@ -2164,12 +3139,25 @@ export default function App() {
     showNotice(t('imageEditSkipped', { pages }))
   }
 
+  const noticeSkippedTextInserts = (skipped: TextInsertFailure[]) => {
+    const pages = [...new Set(skipped.map((s) => s.pageIndex + 1))].sort((a, b) => a - b).join(', ')
+    showNotice(t('textInsertSkipped', { pages }))
+  }
+
   /** Pending edits in SavePdfRequest form; shared by in-place Save and Save As */
   const editsPayload = (edits: LocalTextEdit[] = textEdits) => ({
     markups: markups.map(({ id: _id, ...rest }) => rest),
+    annotDeletes: annotDeletes.map((d): AnnotDeleteInput => ({
+      pageIndex: d.annot.pageIndex,
+      objNum: d.annot.objNum,
+      subtype: d.annot.type,
+      rect: d.annot.rect,
+    })),
     drawings: drawings.map((d) => d.input),
     textEdits: edits.map((e) => e.input),
+    textInserts: textInserts.map((insert) => insert.input),
     imageEdits: imageEdits.map((e) => e.input),
+    staticFormFills,
     stamps: stampCfg ? renderStamps(stampCfg, visList) : [],
     formValues: [...formEdits.values()],
     rotations: [...rotations].map(([pageIndex, delta]) => ({ pageIndex, delta })),
@@ -2207,8 +3195,10 @@ export default function App() {
     // any edits the user makes while the write is in flight
     const snapshot: SavedSnapshot = {
       markupIds: new Set(markups.map((mk) => mk.id)),
+      annotDeleteIds: new Set(annotDeletes.map((d) => d.id)),
       drawingIds: new Set(drawings.map((dr) => dr.id)),
       textEditIds: new Set(edits.map((te) => te.id)),
+      textInsertIds: new Set(textInserts.map((insert) => insert.id)),
       imageEditIds: new Set(imageEdits.map((ie) => ie.id)),
       stampCfg,
       formEdits,
@@ -2226,6 +3216,9 @@ export default function App() {
       if (result.skippedTextEdits && result.skippedTextEdits.length > 0) {
         noticeSkippedEdits(result.skippedTextEdits)
       }
+      if (result.skippedTextInserts && result.skippedTextInserts.length > 0) {
+        noticeSkippedTextInserts(result.skippedTextInserts)
+      }
       if (result.skippedImageEdits && result.skippedImageEdits.length > 0) {
         noticeSkippedImages(result.skippedImageEdits)
       }
@@ -2233,7 +3226,13 @@ export default function App() {
       try {
         const el = scrollRef.current
         const scrollTop = el?.scrollTop ?? 0
-        await loadDoc(filePath, doc, snapshot)
+        // Page structure/rotation changes cannot retain their old overlays because
+        // their geometry or page numbers no longer match the newly saved document.
+        const canRetainPreview = rotations.size === 0 && deleted.size === 0 && order === null
+        const renderedPageNos = canRetainPreview
+          ? [...visibleRows].flatMap((rowIdx) => (rows[rowIdx] ?? []).map((origIdx) => origIdx + 1))
+          : []
+        await loadDoc(filePath, doc, snapshot, renderedPageNos)
         requestAnimationFrame(() => {
           if (scrollRef.current) scrollRef.current.scrollTop = scrollTop
         })
@@ -2281,7 +3280,15 @@ export default function App() {
     const inFlight = saveInFlightRef.current
     const flushed = inFlight ? await inFlight.catch(() => false) : false
     const edits = flushed
-      ? { markups: [], drawings: [], formValues: [], stamps: [], textEdits: [], imageEdits: [] }
+      ? {
+          markups: [],
+          drawings: [],
+          formValues: [],
+          stamps: [],
+          textEdits: [],
+          textInserts: [],
+          imageEdits: [],
+        }
       : editsPayload(draftEdits)
     setSaveState('saving')
     const result = await window.pdfApi.save({ path: filePath, targetPath, ...edits })
@@ -2291,6 +3298,9 @@ export default function App() {
     }
     if (result.skippedTextEdits && result.skippedTextEdits.length > 0) {
       noticeSkippedEdits(result.skippedTextEdits)
+    }
+    if (result.skippedTextInserts && result.skippedTextInserts.length > 0) {
+      noticeSkippedTextInserts(result.skippedTextInserts)
     }
     if (result.skippedImageEdits && result.skippedImageEdits.length > 0) {
       noticeSkippedImages(result.skippedImageEdits)
@@ -2462,14 +3472,166 @@ export default function App() {
     setPendingSign(null)
   }
 
+  /** Fit a visual signature into an AcroForm /Sig widget. */
+  const placeSignatureInField = (sig: SignatureData, target: FormWidget) => {
+    pushUndo()
+    setDrawings((prev) => [
+      ...prev,
+      {
+        id: newId(),
+        input: signatureDrawingForField(sig, target, drawColor),
+        formWidgetId: target.id,
+      },
+    ])
+    setSignatureTarget(null)
+    setActiveFormWidgetId(target.id)
+  }
+
   // ── Image editing (content-stream image ops, applied by the main process at save) ──
+
+  const prepareStaticFormFill = (
+    kind: StaticFormFillKind,
+    image: Extract<SignatureData, { kind: 'image' }>,
+  ) => {
+    setEditTextMode(false)
+    setTextDraft(null)
+    setPendingTextInsert(null)
+    setDrawTool(null)
+    setPendingSign(null)
+    setSignatureTarget(null)
+    setEditImageMode(false)
+    setPendingStaticFill(kind)
+    setImagePick(image)
+  }
+
+  const startStaticFormMark = (kind: 'check' | 'cross') => {
+    if (pendingStaticFill === kind) {
+      setImagePick(null)
+      setPendingStaticFill(null)
+      return
+    }
+    const image = renderStaticFormMark(kind)
+    if (image) prepareStaticFormFill(kind, image)
+  }
+
+  const textInsertOffsets = (
+    text: string,
+    fontSize: number,
+    align: 'left' | 'center' | 'right',
+  ): number[] => {
+    if (align === 'left') return text.split('\n').map(() => 0)
+    const font = `${fontSize}px ${getComputedStyle(document.body).fontFamily}`
+    return text
+      .split('\n')
+      .map((line) => measureTextWidth(line, font) * (align === 'center' ? -0.5 : -1))
+  }
+
+  const confirmTextInsert = () => {
+    const text = staticText.trim()
+    if (!text) return
+    const config: Omit<TextInsertInput, 'pageIndex' | 'origin'> = {
+      text,
+      fontSize: staticTextSize,
+      color: hexTo255(staticTextColor),
+      lineLeading: staticTextSize * 1.2,
+      lineXOffsets: textInsertOffsets(text, staticTextSize, staticTextAlign),
+      align: staticTextAlign,
+    }
+    setStaticTextDialog(false)
+    if (textInsertEditId) {
+      pushUndo()
+      setTextInserts((prev) =>
+        prev.map((insert) =>
+          insert.id === textInsertEditId
+            ? { ...insert, input: { ...insert.input, ...config } }
+            : insert,
+        ),
+      )
+      setTextInsertEditId(null)
+      return
+    }
+    setPendingTextInsert(config)
+  }
+
+  const confirmStaticFormText = () => {
+    if (staticTextPurpose === 'insert') {
+      confirmTextInsert()
+      return
+    }
+    const image = renderStaticFormText(staticText, staticTextSize, staticTextColor, staticTextAlign)
+    if (!image) return
+    setStaticTextDialog(false)
+    const target = staticTextEditTarget
+    if (target) {
+      const updated: StaticFormFillRecord = {
+        ...target.record,
+        text: staticText,
+        fontSize: staticTextSize,
+        color: staticTextColor,
+        align: staticTextAlign,
+      }
+      setStaticTextEditTarget(null)
+      if (target.kind === 'saved') {
+        replaceExisting(target.ref, image.image, updated)
+      } else {
+        pushUndo()
+        setSelected(null)
+        setImageEdits((prev) =>
+          prev.map((edit) => {
+            if (edit.id !== target.editId || edit.input.kind === 'deleteImage') return edit
+            const input =
+              edit.input.kind === 'insertImage'
+                ? { ...edit.input, image: image.image }
+                : edit.input.kind === 'replaceImage'
+                  ? { ...edit.input, image: image.image }
+                  : {
+                      kind: 'replaceImage' as const,
+                      pageIndex: edit.input.pageIndex,
+                      oldRect: edit.input.oldRect,
+                      rect: edit.input.rect,
+                      image: image.image,
+                      layer: edit.input.layer,
+                      quarterTurns: edit.input.quarterTurns,
+                    }
+            return { ...edit, input, staticFill: { ...updated, rect: input.rect } }
+          }),
+        )
+      }
+      return
+    }
+    prepareStaticFormFill('text', image)
+  }
+
+  const placeTextInsert = (origIdx: number, vx: number, vy: number) => {
+    const pending = pendingTextInsert
+    if (!pending) return
+    const geom = pageGeom(origIdx)
+    pushUndo()
+    setTextInserts((prev) => [
+      ...prev,
+      {
+        id: newId(),
+        input: {
+          ...pending,
+          pageIndex: origIdx,
+          origin: viewToPdf(geom, vx, vy),
+          rotate: ((geom.rot % 360) + 360) % 360,
+        },
+      },
+    ])
+    setPendingTextInsert(null)
+    setTextInsertPointer(null)
+  }
 
   /** Ribbon button → file picker; the picked image then enters click-to-place mode */
   const pickInsertImage = () => {
     setEditTextMode(false)
     setTextDraft(null)
+    setPendingTextInsert(null)
     setDrawTool(null)
     setPendingSign(null)
+    setSignatureTarget(null)
+    setPendingStaticFill(null)
     replaceTargetRef.current = null
     imageFileRef.current?.click()
   }
@@ -2481,10 +3643,11 @@ export default function App() {
     const target = replaceTargetRef.current
     if (target) {
       replaceTargetRef.current = null
-      replaceExisting(target, base64)
+      commitBaked(target, base64)
       return
     }
     setImagePick({ kind: 'image', image: base64, width: canvas.width, height: canvas.height })
+    setPendingStaticFill(null)
   }
 
   /** Drop the picked image centered on the click point, into the text-below band by default */
@@ -2493,29 +3656,56 @@ export default function App() {
     if (!pick) return
     const geom = pageGeom(origIdx)
     const disp = geomDispSize(geom)
-    const k = imagePlaceK(pick, disp.width, disp.height)
+    const k = pendingStaticFill
+      ? staticFormFillPlaceK()
+      : imagePlaceK(pick, disp.width, disp.height)
     const w = pick.width * k
     const h = pick.height * k
     const left = Math.min(Math.max(vx - w / 2, 0), Math.max(disp.width - w, 0))
     const top = Math.min(Math.max(vy - h / 2, 0), Math.max(disp.height - h, 0))
     const [ax, ay] = viewToPdf(geom, left, top)
     const [bx, by] = viewToPdf(geom, left + w, top + h)
+    const rect: [number, number, number, number] = [
+      Math.min(ax, bx),
+      Math.min(ay, by),
+      Math.max(ax, bx),
+      Math.max(ay, by),
+    ]
+    const id = newId()
+    const staticFill: StaticFormFillRecord | undefined = pendingStaticFill
+      ? {
+          id,
+          kind: pendingStaticFill,
+          pageIndex: origIdx,
+          rect,
+          ...(pendingStaticFill === 'text'
+            ? {
+                text: staticText,
+                fontSize: staticTextSize,
+                color: staticTextColor,
+                align: staticTextAlign,
+              }
+            : {}),
+        }
+      : undefined
     pushUndo()
     setImageEdits((prev) => [
       ...prev,
       {
-        id: newId(),
+        id,
         input: {
           kind: 'insertImage',
           pageIndex: origIdx,
           image: pick.image,
-          rect: [Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)],
-          layer: 'belowText',
+          rect,
+          layer: pendingStaticFill ? 'aboveText' : 'belowText',
           rotate: ((geom.rot % 360) + 360) % 360,
         },
+        staticFill,
       },
     ])
     setImagePick(null)
+    setPendingStaticFill(null)
   }
 
   /** Committed move/resize of a pending image op */
@@ -2560,6 +3750,41 @@ export default function App() {
     existingPngFetches.current.clear()
   }, [doc])
 
+  const savedStaticFillForRef = (ref: PageImageRef): StaticFormFillRecord | undefined =>
+    savedStaticFormFills.find(
+      (record) => record.pageIndex === ref.pageIndex && rectsNear(record.rect, ref.rect),
+    )
+
+  const selectedStaticTextTarget = () => {
+    if (selected?.kind === 'pageImage') {
+      const record = savedStaticFillForRef(selected.ref)
+      return record?.kind === 'text'
+        ? ({ kind: 'saved', ref: selected.ref, record } as const)
+        : null
+    }
+    if (selected?.kind === 'imageEdit') {
+      const edit = imageEdits.find((candidate) => candidate.id === selected.id)
+      return edit?.staticFill?.kind === 'text'
+        ? ({ kind: 'pending', editId: edit.id, record: edit.staticFill } as const)
+        : null
+    }
+    return null
+  }
+
+  const startEditStaticText = () => {
+    const target = selectedStaticTextTarget()
+    if (!target) return
+    setStaticText(target.record.text ?? '')
+    setStaticTextSize(target.record.fontSize ?? 14)
+    setStaticTextColor(target.record.color ?? '#111111')
+    setStaticTextAlign(target.record.align ?? 'left')
+    setStaticTextEditTarget(target)
+    setStaticTextPurpose('form')
+    setTextInsertEditId(null)
+    setSelected(null)
+    setStaticTextDialog(true)
+  }
+
   /** First touch of an existing image (drag/resize/layer/rotate) becomes a pending transform
       op; its rendered pixels come from the prefetch cache or are fetched for the ghost preview */
   const transformExisting = (
@@ -2572,6 +3797,7 @@ export default function App() {
     setSelected(null)
     const id = newId()
     const cached = existingPngs.get(`${ref.pageIndex}:${imageRectKey(ref.rect)}`) ?? null
+    const savedStaticFill = savedStaticFillForRef(ref)
     setImageEdits((prev) => [
       ...prev,
       {
@@ -2586,6 +3812,7 @@ export default function App() {
         },
         png: cached,
         origAbove: ref.aboveText,
+        staticFill: savedStaticFill ? { ...savedStaticFill, rect } : undefined,
       },
     ])
     if (cached) return
@@ -2608,24 +3835,28 @@ export default function App() {
     return [cx - h / 2, cy - w / 2, cx + h / 2, cy + w / 2]
   }
 
-  /** Rotate PNG pixels by a quarter turn (fresh inserts carry rotation baked into the bytes) */
-  const rotatePng90 = (b64: string, cw: boolean): Promise<string | null> =>
-    new Promise((resolve) => {
+  /** Rotate PNG pixels by 0-3 screen-clockwise quarter turns (fresh inserts carry
+      rotation baked into the bytes; the bake pipeline collapses pending op turns) */
+  const rotatePngTurns = (b64: string, turns: number): Promise<string | null> => {
+    const tn = ((turns % 4) + 4) % 4
+    if (tn === 0) return Promise.resolve(b64)
+    return new Promise((resolve) => {
       const img = new Image()
       img.onload = () => {
         const c = document.createElement('canvas')
-        c.width = img.height
-        c.height = img.width
+        c.width = tn % 2 === 0 ? img.width : img.height
+        c.height = tn % 2 === 0 ? img.height : img.width
         const ctx = c.getContext('2d')
         if (!ctx) return resolve(null)
         ctx.translate(c.width / 2, c.height / 2)
-        ctx.rotate(((cw ? 90 : -90) * Math.PI) / 180)
+        ctx.rotate((tn * 90 * Math.PI) / 180)
         ctx.drawImage(img, -img.width / 2, -img.height / 2)
         resolve(c.toDataURL('image/png').split(',')[1] ?? null)
       }
       img.onerror = () => resolve(null)
       img.src = `data:image/png;base64,${b64}`
     })
+  }
 
   /** Rotate the selected image a quarter turn (screen-clockwise when dir = 1) */
   const rotateSelected = (dir: 1 | -1) => {
@@ -2643,7 +3874,7 @@ export default function App() {
     setSelected(null)
     if (edit.input.kind === 'insertImage') {
       const { image } = edit.input
-      void rotatePng90(image, dir === 1).then((rotated) => {
+      void rotatePngTurns(image, turn).then((rotated) => {
         if (!rotated) return
         // The canvas turn is async: snapshot via the ref (the closed-over pushUndo
         // would capture click-time state) and rotate the element's CURRENT rect —
@@ -2656,7 +3887,12 @@ export default function App() {
         setImageEdits((prev) =>
           prev.map((e) =>
             e.id === sel.id && e.input.kind === 'insertImage' && e.input.image === image
-              ? { ...e, input: { ...e.input, image: rotated, rect: rotatedRect(e.input.rect) } }
+              ? {
+                  ...e,
+                  // rotating the bytes invalidates a recorded pre-transparency base
+                  opacityBase: undefined,
+                  input: { ...e.input, image: rotated, rect: rotatedRect(e.input.rect) },
+                }
               : e,
           ),
         )
@@ -2681,7 +3917,7 @@ export default function App() {
   }
 
   /** Queue an in-place pixel swap of an existing image (footprint/z-order kept) */
-  const replaceExisting = (ref: PageImageRef, png: string) => {
+  const replaceExisting = (ref: PageImageRef, png: string, staticFill?: StaticFormFillRecord) => {
     pushUndo()
     setSelected(null)
     setImageEdits((prev) => [
@@ -2696,16 +3932,241 @@ export default function App() {
           image: png,
         },
         origAbove: ref.aboveText,
+        staticFill,
       },
     ])
   }
 
+  // ── Baked pixel edits (flip / transparency / crop / cutout / replace) ──
+  // PDF images are bitmaps, so these all land the same way: fetch the selection's
+  // displayed pixels, transform them on a canvas, and write the result back — a new
+  // replaceImage op for an untouched image, or an in-place byte swap of a pending op
+  // (transform ops morph into replaceImage with their quarter turns baked in).
+
+  /** What a pixel edit applies to; `before` guards edit ops against concurrent changes
+      (state inputs are immutable, so reference equality detects any interim mutation) */
+  type ImageBakeTarget =
+    { kind: 'existing'; ref: PageImageRef } | { kind: 'edit'; id: string; before: ImageEditInput }
+
+  const bakeTargetOf = (sel: AnnotSelection | null): ImageBakeTarget | null => {
+    if (sel?.kind === 'pageImage') return { kind: 'existing', ref: sel.ref }
+    if (sel?.kind !== 'imageEdit') return null
+    const e = imageEdits.find((x) => x.id === sel.id)
+    if (!e || e.input.kind === 'deleteImage') return null
+    return { kind: 'edit', id: sel.id, before: e.input }
+  }
+
+  /** Upscale over the on-page size when fetching bake sources, so crop/flip results
+      stay print-sharp instead of inheriting the ~1px/pt ghost resolution */
+  const BAKE_SCALE = 3
+
+  /** The target's pixels in displayed orientation (pending quarter turns baked in) */
+  const bakeSourcePng = async (target: ImageBakeTarget): Promise<string | null> => {
+    const fetchPng = (pageIndex: number, rect: [number, number, number, number]) =>
+      window.pdfApi
+        .pageImagePng({ path: filePath, pageIndex, rect, scale: BAKE_SCALE })
+        .catch(() => null)
+    if (target.kind === 'existing') return fetchPng(target.ref.pageIndex, target.ref.rect)
+    const input = target.before
+    if (input.kind === 'insertImage') return input.image
+    if (input.kind === 'replaceImage') return rotatePngTurns(input.image, input.quarterTurns ?? 0)
+    if (input.kind === 'transformImage') {
+      const src = await fetchPng(input.pageIndex, input.oldRect)
+      return src ? rotatePngTurns(src, input.quarterTurns ?? 0) : null
+    }
+    return null
+  }
+
+  /** Decode a PNG, run a same-size pixel transform, re-encode (null on failure) */
+  const transformPngPixels = (
+    b64: string,
+    fn: (img: PixelImage) => Uint8ClampedArray<ArrayBuffer>,
+  ): Promise<string | null> =>
+    new Promise((resolve) => {
+      const img = new Image()
+      img.onload = () => {
+        const w = img.naturalWidth
+        const h = img.naturalHeight
+        const c = document.createElement('canvas')
+        c.width = w
+        c.height = h
+        const ctx = c.getContext('2d')
+        if (!ctx || !w || !h) return resolve(null)
+        ctx.drawImage(img, 0, 0)
+        const d = ctx.getImageData(0, 0, w, h)
+        ctx.putImageData(new ImageData(fn({ data: d.data, width: w, height: h }), w, h), 0, 0)
+        resolve(c.toDataURL('image/png').split(',')[1] ?? null)
+      }
+      img.onerror = () => resolve(null)
+      img.src = `data:image/png;base64,${b64}`
+    })
+
+  /** Crop footprint of an insert op: its bytes are display-oriented, so the fractions
+      apply in display space and map back through the page geometry (handles /Rotate) */
+  const cropRectDisplay = (
+    pageIndex: number,
+    rect: [number, number, number, number],
+    crop: CropFractions,
+  ): [number, number, number, number] => {
+    const geom = pageGeom(pageIndex)
+    const box = pdfRectToCss(geom, rect, 1)
+    const [ax, ay] = viewToPdf(geom, box.left + crop.l * box.width, box.top + crop.t * box.height)
+    const [bx, by] = viewToPdf(geom, box.left + crop.r * box.width, box.top + crop.b * box.height)
+    return [Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)]
+  }
+
+  /** Land baked pixels on the target (see the section comment); crop also shrinks the
+      footprint to the kept region. Silently drops results that lost a race.
+      opacityBase marks the bytes as a transparency bake (see LocalImageEdit); any other
+      pixel edit leaves it unset, which clears a stale base. */
+  const commitBaked = (
+    target: ImageBakeTarget,
+    png: string,
+    crop?: CropFractions,
+    opacityBase?: string,
+  ) => {
+    if (target.kind === 'existing') {
+      const ref = target.ref
+      const key = `${ref.pageIndex}:${imageRectKey(ref.rect)}`
+      const claimed = imageEditsRef.current.some(
+        (e) =>
+          e.input.kind !== 'insertImage' &&
+          `${e.input.pageIndex}:${imageRectKey(e.input.oldRect)}` === key,
+      )
+      if (claimed) return
+      pushUndoRef.current()
+      setImageEdits((prev) => [
+        ...prev,
+        {
+          id: newId(),
+          input: {
+            kind: 'replaceImage',
+            pageIndex: ref.pageIndex,
+            oldRect: ref.rect,
+            rect: crop ? cropRect(ref.rect, crop) : ref.rect,
+            image: png,
+          },
+          origAbove: ref.aboveText,
+          opacityBase,
+        },
+      ])
+      return
+    }
+    const cur = imageEditsRef.current.find((x) => x.id === target.id)
+    if (!cur || cur.input !== target.before || cur.input.kind === 'deleteImage') return
+    pushUndoRef.current()
+    setImageEdits((prev) =>
+      prev.map((e) => {
+        if (e.id !== target.id || e.input.kind !== cur.input.kind) return e
+        if (e.input.kind === 'insertImage') {
+          return {
+            ...e,
+            opacityBase,
+            input: {
+              ...e.input,
+              image: png,
+              rect: crop ? cropRectDisplay(e.input.pageIndex, e.input.rect, crop) : e.input.rect,
+            },
+          }
+        }
+        if (e.input.kind !== 'transformImage' && e.input.kind !== 'replaceImage') return e
+        return {
+          ...e,
+          opacityBase,
+          input: {
+            kind: 'replaceImage',
+            pageIndex: e.input.pageIndex,
+            oldRect: e.input.oldRect,
+            rect: crop ? cropRect(e.input.rect, crop) : e.input.rect,
+            image: png,
+            ...(e.input.layer ? { layer: e.input.layer } : {}),
+          },
+        }
+      }),
+    )
+  }
+
+  /** Fetch → transform → commit, used by the one-click bakes (flip / transparency) */
+  const bakeSelected = (fn: (img: PixelImage) => Uint8ClampedArray<ArrayBuffer>) => {
+    const target = bakeTargetOf(selected)
+    if (!target) return
+    setSelected(null)
+    void (async () => {
+      const src = await bakeSourcePng(target)
+      const out = src ? await transformPngPixels(src, fn) : null
+      if (out) commitBaked(target, out)
+    })()
+  }
+
+  const flipSelected = (axis: 'h' | 'v') => bakeSelected((img) => flipPixels(img, axis))
+
+  /** Bake a transparency preset (percent transparent, slides-style ladder). Absolute,
+      not compounding: when the op's bytes came from an earlier transparency bake,
+      re-bake from the recorded pre-transparency pixels (bytes-only swap — rect, layer
+      and pending quarter turns stay put). */
+  const applyImageOpacity = (pct: number) => {
+    const target = bakeTargetOf(selected)
+    if (!target) return
+    setSelected(null)
+    const alpha = (img: PixelImage) => multiplyAlpha(img, 1 - pct / 100)
+    void (async () => {
+      const prior =
+        target.kind === 'edit'
+          ? imageEditsRef.current.find((x) => x.id === target.id)?.opacityBase
+          : undefined
+      if (prior && target.kind === 'edit') {
+        const out = await transformPngPixels(prior, alpha)
+        if (!out) return
+        // Reject a lost race BEFORE pushing undo (same as commitBaked), or ⌘Z
+        // would record a phantom step for the no-op map below
+        const cur = imageEditsRef.current.find((x) => x.id === target.id)
+        if (
+          !cur ||
+          cur.input !== target.before ||
+          (cur.input.kind !== 'insertImage' && cur.input.kind !== 'replaceImage')
+        ) {
+          return
+        }
+        pushUndoRef.current()
+        setImageEdits((prev) =>
+          prev.map((e) =>
+            e.id === target.id &&
+            e.input === target.before &&
+            (e.input.kind === 'insertImage' || e.input.kind === 'replaceImage')
+              ? { ...e, opacityBase: prior, input: { ...e.input, image: out } }
+              : e,
+          ),
+        )
+        return
+      }
+      const src = await bakeSourcePng(target)
+      const out = src ? await transformPngPixels(src, alpha) : null
+      if (out) commitBaked(target, out, undefined, src ?? undefined)
+    })()
+  }
+
+  /** Crop / remove-background dialog over the selection's fetched pixels */
+  const [imageDialog, setImageDialog] = useState<{
+    kind: 'crop' | 'cutout'
+    target: ImageBakeTarget
+    image: string
+  } | null>(null)
+
+  const openImageDialog = (kind: 'crop' | 'cutout') => {
+    const target = bakeTargetOf(selected)
+    if (!target) return
+    setSelected(null)
+    void bakeSourcePng(target).then((src) => {
+      if (src) setImageDialog({ kind, target, image: src })
+    })
+  }
+
   /** Replace flow: the bubble button stashes the target, then reuses the insert file input */
-  const replaceTargetRef = useRef<PageImageRef | null>(null)
+  const replaceTargetRef = useRef<ImageBakeTarget | null>(null)
   const startReplaceImage = () => {
-    const sel = selected
-    if (sel?.kind !== 'pageImage') return
-    replaceTargetRef.current = sel.ref
+    const target = bakeTargetOf(selected)
+    if (!target) return
+    replaceTargetRef.current = target
     setSelected(null)
     imageFileRef.current?.click()
   }
@@ -2755,18 +4216,29 @@ export default function App() {
   )
 
   // ── Live page preview: pdfium re-renders the touched region without the moved/
-  // resized/deleted images, so the original vanishes immediately instead of at save ──
+  // resized/deleted images and without deleted saved annotations, so the original
+  // vanishes immediately instead of at save ──
 
-  /** Pages with pending transform/delete ops → the original rects to erase */
+  /** Pages with pending erase ops → image rects to remove + saved annotations to remove */
   const livePreviewRects = useMemo(() => {
-    const map = new Map<number, [number, number, number, number][]>()
-    for (const e of imageEdits) {
-      if (e.input.kind !== 'insertImage') {
-        map.set(e.input.pageIndex, [...(map.get(e.input.pageIndex) ?? []), e.input.oldRect])
+    const map = new Map<
+      number,
+      { rects: [number, number, number, number][]; annots: SavedMarkupAnnot[] }
+    >()
+    const jobFor = (pageIndex: number) => {
+      let job = map.get(pageIndex)
+      if (!job) {
+        job = { rects: [], annots: [] }
+        map.set(pageIndex, job)
       }
+      return job
     }
+    for (const e of imageEdits) {
+      if (e.input.kind !== 'insertImage') jobFor(e.input.pageIndex).rects.push(e.input.oldRect)
+    }
+    for (const d of annotDeletes) jobFor(d.annot.pageIndex).annots.push(d.annot)
     return map
-  }, [imageEdits])
+  }, [imageEdits, annotDeletes])
 
   const [livePreview, setLivePreview] = useState<
     Map<number, { png: string; clip: { x: number; y: number; width: number; height: number } }>
@@ -2785,7 +4257,7 @@ export default function App() {
       for (const p of [...next.keys()]) if (!livePreviewRects.has(p)) next.delete(p)
       return next
     })
-    for (const [pageIndex, rects] of livePreviewRects) {
+    for (const [pageIndex, job] of livePreviewRects) {
       const geom = pageGeom(pageIndex)
       const disp = geomDispSize(geom)
       // Union of the erased rects in display coords, padded and clamped to the page
@@ -2793,7 +4265,7 @@ export default function App() {
       let y1 = Infinity
       let x2 = -Infinity
       let y2 = -Infinity
-      for (const r of rects) {
+      for (const r of [...job.rects, ...job.annots.map((a) => a.rect)]) {
         const b = pdfRectToCss(geom, r, 1)
         x1 = Math.min(x1, b.left)
         y1 = Math.min(y1, b.top)
@@ -2810,14 +4282,24 @@ export default function App() {
       const dpr = Math.min(window.devicePixelRatio || 1, 2)
       const pxWidth = Math.min(Math.ceil(clip.width * scale * dpr), 2800)
       const rotIdx = ((Math.round(rotDelta(pageIndex) / 90) % 4) + 4) % 4
-      const key = `${rects.map(imageRectKey).join(';')}|${pxWidth}|${rotIdx}`
+      const excludedAnnots = job.annots.map((a): AnnotDeleteInput => ({
+        pageIndex: a.pageIndex,
+        objNum: a.objNum,
+        subtype: a.type,
+        rect: a.rect,
+      }))
+      const annotKey = excludedAnnots
+        .map((a) => `${a.objNum}:${a.subtype}:${imageRectKey(a.rect)}`)
+        .join(',')
+      const key = `${job.rects.map(imageRectKey).join(';')}|${annotKey}|${pxWidth}|${rotIdx}`
       if (livePreviewKeys.current.get(pageIndex) === key) continue
       livePreviewKeys.current.set(pageIndex, key)
       void window.pdfApi
         .pagePreviewPng({
           path: filePath,
           pageIndex,
-          excludeRects: rects,
+          excludeRects: job.rects,
+          ...(excludedAnnots.length > 0 ? { excludeAnnots: excludedAnnots } : {}),
           clip,
           pxWidth,
           rotate: rotIdx,
@@ -3119,6 +4601,26 @@ export default function App() {
     return () => window.removeEventListener('pointerdown', close)
   }, [colorOpen])
 
+  useEffect(() => {
+    if (!highlightColorOpen) return
+    const close = (e: PointerEvent) => {
+      if (!(e.target as Element | null)?.closest?.('.rb-highlight-drop-wrap'))
+        setHighlightColorOpen(false)
+    }
+    window.addEventListener('pointerdown', close)
+    return () => window.removeEventListener('pointerdown', close)
+  }, [highlightColorOpen])
+
+  useEffect(() => {
+    if (!textDraftColorOpen) return
+    const close = (event: PointerEvent) => {
+      if (!(event.target as Element | null)?.closest?.('.pdf-text-color-wrap'))
+        setTextDraftColorOpen(false)
+    }
+    window.addEventListener('pointerdown', close)
+    return () => window.removeEventListener('pointerdown', close)
+  }, [textDraftColorOpen])
+
   // Main process picked "Save" in the close prompt → save and report the result
   useEffect(() => {
     return window.pdfApi.onCloseSaveRequest(() => {
@@ -3173,6 +4675,7 @@ export default function App() {
       }
       if (e.key === 'Escape') {
         if (textDraft) setTextDraft(null)
+        else if (pendingTextInsert) setPendingTextInsert(null)
         else if (imagePick) setImagePick(null)
         else if (editTextMode) setEditTextMode(false)
         else if (editImageMode) setEditImageMode(false)
@@ -3291,21 +4794,49 @@ export default function App() {
   const markupGroup = (
     <div className="ribbon-group" onMouseDown={(e) => e.preventDefault()}>
       <div className="ribbon-group-items">
+        <div className="rb-drop-wrap rb-highlight-drop-wrap rb-highlight-split">
+          <button
+            className="rb-big rb-highlight-main"
+            disabled={readOnly}
+            data-tip={t('highlight')}
+            onClick={() => applyMarkup('highlight')}
+          >
+            <span className="rb-big-icon">
+              <span className="rb-big-icon-colored">
+                <IconHighlight />
+                <span className="rb-color-bar" style={{ background: cssRgb(highlightColor) }} />
+              </span>
+            </span>
+            {t('highlight')}
+          </button>
+          <button
+            className={`rb-highlight-caret${highlightColorOpen ? ' active' : ''}`}
+            disabled={readOnly}
+            aria-label={t('drawColor')}
+            data-tip={t('drawColor')}
+            onClick={() => setHighlightColorOpen((open) => !open)}
+          >
+            <RbCaret />
+          </button>
+          {highlightColorOpen && (
+            <div className="rb-drop pdf-color-picker-popup">
+              <ColorPalette
+                value={rgbToHex(highlightColor)}
+                presets={HIGHLIGHT_COLOR_PRESETS}
+                columns={4}
+                moreColorsLabel={t('moreColors')}
+                onChange={(value, source) => {
+                  setHighlightColor(hexToRgb(value))
+                  if (source === 'preset') setHighlightColorOpen(false)
+                }}
+              />
+            </div>
+          )}
+        </div>
         <button
           className="rb-big"
           disabled={readOnly}
-          title={t('highlight')}
-          onClick={() => applyMarkup('highlight')}
-        >
-          <span className="rb-big-icon">
-            <IconHighlight />
-          </span>
-          {t('highlight')}
-        </button>
-        <button
-          className="rb-big"
-          disabled={readOnly}
-          title={t('underline')}
+          data-tip={t('underline')}
           onClick={() => applyMarkup('underline')}
         >
           <span className="rb-big-icon">
@@ -3316,7 +4847,7 @@ export default function App() {
         <button
           className="rb-big"
           disabled={readOnly}
-          title={t('strikeout')}
+          data-tip={t('strikeout')}
           onClick={() => applyMarkup('strikeout')}
         >
           <span className="rb-big-icon">
@@ -3343,11 +4874,21 @@ export default function App() {
             <span className="tb-page-total">{t('pageOf', { total: pageCount })}</span>
           </div>
           <div className="rb-row">
-            <button className="rb-icon" title={t('zoomOut')} onClick={zoomOut}>
+            <button
+              className="rb-icon"
+              data-tip={t('zoomOut')}
+              aria-label={t('zoomOut')}
+              onClick={zoomOut}
+            >
               −
             </button>
             <span className="tb-zoom">{Math.round(scale * 100)}%</span>
-            <button className="rb-icon" title={t('zoomIn')} onClick={zoomIn}>
+            <button
+              className="rb-icon"
+              data-tip={t('zoomIn')}
+              aria-label={t('zoomIn')}
+              onClick={zoomIn}
+            >
               +
             </button>
           </div>
@@ -3383,7 +4924,7 @@ export default function App() {
   const searchBtn = (
     <button
       className={`rb-big${searchOpen ? ' active' : ''}`}
-      title={`${t('search')} (⌘F)`}
+      data-tip={`${t('search')} (${platformShortcuts('⌘F')})`}
       onClick={() => (searchOpen ? closeSearch() : openSearch())}
     >
       <span className="rb-big-icon">
@@ -3397,9 +4938,10 @@ export default function App() {
     <button
       className={`rb-big${editTextMode ? ' active' : ''}`}
       disabled={readOnly}
-      title={t('editTextHint')}
+      data-tip={t('editTextHint')}
       onClick={() => {
         setTextDraft(null)
+        setPendingTextInsert(null)
         setDrawTool(null)
         setPendingSign(null)
         setImagePick(null)
@@ -3413,6 +4955,38 @@ export default function App() {
       {t('editText')}
     </button>
   )
+
+  const activeFormWidget = activeFormIndex >= 0 ? formWidgets[activeFormIndex]! : null
+  const formWidgetSigned = (widget: FormWidget): boolean =>
+    widget.signed || signedFormWidgetIds.has(widget.id)
+  const firstSignatureWidget =
+    formWidgets.find((widget) => widget.kind === 'signature' && !formWidgetSigned(widget)) ?? null
+
+  const openSignatureDialog = (target: FormWidget | null) => {
+    setEditTextMode(false)
+    setTextDraft(null)
+    setPendingTextInsert(null)
+    setDrawTool(null)
+    setImagePick(null)
+    setEditImageMode(false)
+    setPendingSign(null)
+    setSignatureTarget(target)
+    if (target) focusFormWidget(target)
+    setSignDlg(true)
+  }
+
+  const completeForm = () => {
+    if (missingRequiredFields.length > 0) {
+      showNotice(t('formMissingRequired', { count: missingRequiredFields.length }))
+      const firstMissing = formWidgets.find(
+        (widget) => widget.fieldName === missingRequiredFields[0]!.name,
+      )
+      if (firstMissing) focusFormWidget(firstMissing)
+      return
+    }
+    showNotice(t('formCompleteDone'))
+    setRibbonTab('home')
+  }
 
   const viewNavGroup = (
     <div className="ribbon-group">
@@ -3439,7 +5013,7 @@ export default function App() {
         {searchBtn}
         <button
           className={`rb-big${spread === 2 ? ' active' : ''}`}
-          title={spread === 2 ? t('singlePage') : t('twoPage')}
+          data-tip={spread === 2 ? t('singlePage') : t('twoPage')}
           onClick={() => setSpread((v) => (v === 1 ? 2 : 1))}
         >
           <span className="rb-big-icon">{spread === 2 ? <IconSinglePage /> : <IconSpread />}</span>
@@ -3447,7 +5021,7 @@ export default function App() {
         </button>
         <button
           className={`rb-big${nightMode ? ' active' : ''}`}
-          title={t('nightMode')}
+          data-tip={t('nightMode')}
           onClick={() => setNightMode((v) => !v)}
         >
           <span className="rb-big-icon">
@@ -3465,7 +5039,7 @@ export default function App() {
         <div className="ribbon-tabs">
           <button
             className="qa-btn"
-            title={`${t('save')} (⌘S)`}
+            data-tip={`${t('save')} (${platformShortcuts('⌘S')})`}
             aria-label={t('save')}
             disabled={!dirty || saveState === 'saving'}
             onClick={() => void save()}
@@ -3474,7 +5048,8 @@ export default function App() {
           </button>
           <button
             className="qa-btn"
-            title={`${t('undo')} (⌘Z)`}
+            data-tip={`${t('undo')} (${platformShortcuts('⌘Z')})`}
+            aria-label={`${t('undo')} (${platformShortcuts('⌘Z')})`}
             disabled={undoStack.length === 0}
             onClick={undo}
           >
@@ -3482,7 +5057,8 @@ export default function App() {
           </button>
           <button
             className="qa-btn"
-            title={`${t('redo')} (⇧⌘Z)`}
+            data-tip={`${t('redo')} (${platformShortcuts('⇧⌘Z')})`}
+            aria-label={`${t('redo')} (${platformShortcuts('⇧⌘Z')})`}
             disabled={redoStack.length === 0}
             onClick={redo}
           >
@@ -3498,13 +5074,17 @@ export default function App() {
               {t(labelKey)}
             </button>
           ))}
+          {!readOnly && (
+            <button
+              className={`ribbon-tab ribbon-tab-context${ribbonTab === 'fillForm' ? ' active' : ''}`}
+              onClick={() => setRibbonTab('fillForm')}
+            >
+              {t('ribbonTabFillForm')}
+            </button>
+          )}
           <span className="ribbon-tabs-spacer" />
-          <span className="ribbon-file" title={filePath}>
-            {fileName}
-          </span>
           {readOnly && <span className="tb-readonly">{t('roEncrypted')}</span>}
-          {/* Unsaved-changes indicator next to the file name: the file on disk
-              is only touched by an explicit save until then */}
+          {/* The file on disk is only touched by an explicit save until then. */}
           {saveState === 'saving' ? (
             <span className="tb-save-pending">{t('saving')}</span>
           ) : (
@@ -3512,11 +5092,16 @@ export default function App() {
             saveState !== 'error' && <span className="tb-save-pending">{t('unsaved')}</span>
           )}
           {saveState === 'error' && (
-            <span className="tb-save-error" title={saveError}>
+            <span className="tb-save-error" data-tip={saveError}>
               {t('saveFailed')}
             </span>
           )}
           {saveState === 'saved' && <span className="tb-save-ok">{t('savedOk')}</span>}
+          {formHasXfa && (
+            <span className="tb-form-warning" data-tip={t('formXfaWarning')}>
+              XFA
+            </span>
+          )}
         </div>
         <div className="ribbon-body">
           {ribbonTab === 'home' && (
@@ -3526,7 +5111,7 @@ export default function App() {
                 <div className="ribbon-group-items">
                   <button
                     className={`rb-big ai-entry${aiCollapsed ? '' : ' active'}`}
-                    title={t('aiOpenAssistant')}
+                    data-tip={t('aiOpenAssistant')}
                     onClick={() => setAiCollapsed((v) => !v)}
                   >
                     <span className="rb-big-icon">
@@ -3536,7 +5121,7 @@ export default function App() {
                   </button>
                   <button
                     className="rb-big ai-entry"
-                    title={t('aiQuickSummaryPrompt')}
+                    data-tip={t('aiSummarizeBtn')}
                     onClick={() => runAiPreset(t('aiQuickSummaryPrompt'))}
                   >
                     <span className="rb-big-icon">
@@ -3548,7 +5133,7 @@ export default function App() {
                   </button>
                   <button
                     className="rb-big ai-entry"
-                    title={t('aiQuickKeyPointsPrompt')}
+                    data-tip={t('aiKeyPointsBtn')}
                     onClick={() => runAiPreset(t('aiQuickKeyPointsPrompt'))}
                   >
                     <span className="rb-big-icon">
@@ -3576,7 +5161,7 @@ export default function App() {
                 <div className="ribbon-group-items">
                   <button
                     className="rb-big"
-                    title={`${t('print')} (⌘P)`}
+                    data-tip={`${t('print')} (${platformShortcuts('⌘P')})`}
                     disabled={printing}
                     onClick={() => void printDoc()}
                   >
@@ -3587,7 +5172,7 @@ export default function App() {
                   </button>
                   <button
                     className="rb-big"
-                    title={t('exportImagesAll')}
+                    data-tip={t('exportImagesAll')}
                     disabled={exporting}
                     onClick={() => void exportImages(true)}
                   >
@@ -3598,7 +5183,7 @@ export default function App() {
                   </button>
                   <button
                     className="rb-big"
-                    title={t('propsTitle')}
+                    data-tip={t('propsTitle')}
                     onClick={() => setPropsDlg(true)}
                   >
                     <span className="rb-big-icon">
@@ -3621,10 +5206,11 @@ export default function App() {
                       key={tool}
                       className={`rb-big${drawTool === tool ? ' active' : ''}`}
                       disabled={readOnly}
-                      title={t(key)}
+                      data-tip={t(key)}
                       onClick={() => {
                         setEditTextMode(false)
                         setTextDraft(null)
+                        setPendingTextInsert(null)
                         setImagePick(null)
                         setEditImageMode(false)
                         setDrawTool((v) => (v === tool ? null : tool))
@@ -3639,12 +5225,10 @@ export default function App() {
                   <button
                     className={`rb-big${pendingSign ? ' active' : ''}`}
                     disabled={readOnly}
-                    title={t('signTitle')}
+                    data-tip={t('signTitle')}
                     onClick={() => {
-                      setImagePick(null)
-                      setEditImageMode(false)
                       if (pendingSign) setPendingSign(null)
-                      else setSignDlg(true)
+                      else openSignatureDialog(null)
                     }}
                   >
                     <span className="rb-big-icon">
@@ -3656,7 +5240,7 @@ export default function App() {
                     <button
                       className={`rb-big${colorOpen ? ' active' : ''}`}
                       disabled={readOnly}
-                      title={t('drawColor')}
+                      data-tip={t('drawColor')}
                       onClick={() => setColorOpen((v) => !v)}
                     >
                       <span className="rb-big-icon">
@@ -3672,27 +5256,16 @@ export default function App() {
                       {t('drawColor')}
                     </button>
                     {colorOpen && (
-                      <div className="rb-drop rb-color-grid">
-                        {DRAW_COLORS.map((c) => (
-                          <button
-                            key={c.name}
-                            className={`rb-swatch${cssRgb(drawColor) === cssRgb(c.rgb) ? ' active' : ''}`}
-                            style={{ background: cssRgb(c.rgb) }}
-                            title={c.name}
-                            onClick={() => {
-                              setDrawColor(c.rgb)
-                              setColorOpen(false)
-                            }}
-                          />
-                        ))}
-                        <label className="rb-color-more" title={t('drawColor')}>
-                          <input
-                            type="color"
-                            value={rgbToHex(drawColor)}
-                            onChange={(e) => setDrawColor(hexToRgb(e.target.value))}
-                          />
-                          {t('moreColors')}
-                        </label>
+                      <div className="rb-drop pdf-color-picker-popup">
+                        <ColorPalette
+                          value={rgbToHex(drawColor)}
+                          presets={DRAW_COLOR_PRESETS}
+                          moreColorsLabel={t('moreColors')}
+                          onChange={(value, source) => {
+                            setDrawColor(hexToRgb(value))
+                            if (source === 'preset') setColorOpen(false)
+                          }}
+                        />
                       </div>
                     )}
                   </div>
@@ -3706,9 +5279,37 @@ export default function App() {
                 <div className="ribbon-group-items">
                   {editTextBtn}
                   <button
-                    className={`rb-big${imagePick ? ' active' : ''}`}
+                    className={`rb-big${pendingTextInsert ? ' active' : ''}`}
                     disabled={readOnly}
-                    title={t('insertImageHint')}
+                    data-tip={t('insertTextHint')}
+                    onClick={() => {
+                      if (pendingTextInsert) {
+                        setPendingTextInsert(null)
+                        return
+                      }
+                      setEditTextMode(false)
+                      setTextDraft(null)
+                      setDrawTool(null)
+                      setPendingSign(null)
+                      setSignatureTarget(null)
+                      setImagePick(null)
+                      setPendingStaticFill(null)
+                      setEditImageMode(false)
+                      setTextInsertEditId(null)
+                      setStaticTextPurpose('insert')
+                      setStaticText('')
+                      setStaticTextDialog(true)
+                    }}
+                  >
+                    <span className="rb-big-icon">
+                      <IconFormText />
+                    </span>
+                    {t('insertText')}
+                  </button>
+                  <button
+                    className={`rb-big${imagePick && !pendingStaticFill ? ' active' : ''}`}
+                    disabled={readOnly}
+                    data-tip={t('insertImageHint')}
                     onClick={() => (imagePick ? setImagePick(null) : pickInsertImage())}
                   >
                     <span className="rb-big-icon">
@@ -3719,13 +5320,14 @@ export default function App() {
                   <button
                     className={`rb-big${editImageMode ? ' active' : ''}`}
                     disabled={readOnly}
-                    title={t('editImageHint')}
+                    data-tip={t('editImageHint')}
                     onClick={() => {
                       setEditTextMode(false)
                       setTextDraft(null)
                       setDrawTool(null)
                       setPendingSign(null)
                       setImagePick(null)
+                      setPendingTextInsert(null)
                       setEditImageMode((v) => !v)
                     }}
                   >
@@ -3742,13 +5344,141 @@ export default function App() {
                   <button
                     className="rb-big"
                     disabled={readOnly}
-                    title={t('stampTitle')}
+                    data-tip={t('stampTitle')}
                     onClick={() => setStampDlg(true)}
                   >
                     <span className="rb-big-icon">
                       <IconWatermark />
                     </span>
                     {t('watermark')}
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+          {ribbonTab === 'fillForm' && (
+            <>
+              <div className="ribbon-group">
+                <div className="ribbon-group-items">
+                  <button
+                    className={`rb-big${pendingStaticFill === 'text' ? ' active' : ''}`}
+                    disabled={readOnly}
+                    data-tip={t('formAddTextHint')}
+                    onClick={() => {
+                      setImagePick(null)
+                      setPendingTextInsert(null)
+                      setStaticTextEditTarget(null)
+                      setStaticTextPurpose('form')
+                      setStaticText('')
+                      setStaticTextDialog(true)
+                    }}
+                  >
+                    <span className="rb-big-icon">
+                      <IconFormText />
+                    </span>
+                    {t('formAddText')}
+                  </button>
+                  <button
+                    className={`rb-big${pendingStaticFill === 'check' ? ' active' : ''}`}
+                    disabled={readOnly}
+                    data-tip={t('formAddCheckHint')}
+                    onClick={() => startStaticFormMark('check')}
+                  >
+                    <span className="rb-big-icon">
+                      <IconFormCheck />
+                    </span>
+                    {t('formAddCheck')}
+                  </button>
+                  <button
+                    className={`rb-big${pendingStaticFill === 'cross' ? ' active' : ''}`}
+                    disabled={readOnly}
+                    data-tip={t('formAddCrossHint')}
+                    onClick={() => startStaticFormMark('cross')}
+                  >
+                    <span className="rb-big-icon">
+                      <IconFormCross />
+                    </span>
+                    {t('formAddCross')}
+                  </button>
+                </div>
+              </div>
+              <div className="ribbon-sep" />
+              {hasFillableForm && (
+                <>
+                  <div className="ribbon-group">
+                    <div className="ribbon-group-items">
+                      <button
+                        className="rb-big"
+                        data-tip={t('formPreviousField')}
+                        onClick={() => stepFormWidget(-1)}
+                      >
+                        <span className="rb-big-icon">
+                          <IconPreviousField />
+                        </span>
+                        {t('formPreviousField')}
+                      </button>
+                      <button
+                        className="rb-big"
+                        data-tip={t('formNextField')}
+                        onClick={() => stepFormWidget(1)}
+                      >
+                        <span className="rb-big-icon">
+                          <IconNextField />
+                        </span>
+                        {t('formNextField')}
+                      </button>
+                      <span className="form-ribbon-progress">
+                        {t('formFieldProgress', {
+                          current: activeFormIndex >= 0 ? activeFormIndex + 1 : 0,
+                          total: formWidgets.length,
+                        })}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="ribbon-sep" />
+                </>
+              )}
+              <div className="ribbon-group">
+                <div className="ribbon-group-items">
+                  <button
+                    className="rb-big"
+                    disabled={readOnly}
+                    data-tip={t('signTitle')}
+                    onClick={() =>
+                      openSignatureDialog(
+                        activeFormWidget?.kind === 'signature' &&
+                          !formWidgetSigned(activeFormWidget)
+                          ? activeFormWidget
+                          : firstSignatureWidget,
+                      )
+                    }
+                  >
+                    <span className="rb-big-icon">
+                      <IconSign />
+                    </span>
+                    {t('sign')}
+                  </button>
+                  <button
+                    className={`rb-big${imagePick && !pendingStaticFill ? ' active' : ''}`}
+                    disabled={readOnly}
+                    data-tip={t('insertImageHint')}
+                    onClick={() => (imagePick ? setImagePick(null) : pickInsertImage())}
+                  >
+                    <span className="rb-big-icon">
+                      <IconInsertImage />
+                    </span>
+                    {t('insertImage')}
+                  </button>
+                </div>
+              </div>
+              <div className="ribbon-sep" />
+              <div className="ribbon-group">
+                <div className="ribbon-group-items">
+                  <button className="rb-big" onClick={completeForm}>
+                    <span className="rb-big-icon">
+                      <IconCompleteForm />
+                    </span>
+                    {t('formComplete')}
                   </button>
                 </div>
               </div>
@@ -3837,7 +5567,8 @@ export default function App() {
           {aiCollapsed && (
             <button
               className="ai-rail"
-              title={t('aiOpenAssistant')}
+              data-tip={t('aiOpenAssistant')}
+              aria-label={t('aiOpenAssistant')}
               onClick={() => setAiCollapsed(false)}
             >
               <GensparkMark size={22} />
@@ -3933,9 +5664,11 @@ export default function App() {
               onMouseUp={drawTool ? undefined : handleMouseUp}
               onClick={(e) => {
                 // Clicking anywhere that isn't an annotation clears the selection
+                // (markup overlays are pointer-transparent; when hit they stopPropagation
+                // in handlePageClick before this runs)
                 if (
                   !(e.target as Element).closest?.(
-                    '.pdf-markup, .pdf-draw-shape, .pdf-note-pin, .pdf-stamp-preview, .pdf-textedit-preview, .pdf-textedit-input, .pdf-imgedit-layer, .pdf-imgedit-under',
+                    '.pdf-draw-shape, .pdf-note-pin, .pdf-stamp-preview, .pdf-textedit-preview, .pdf-textinsert-preview, .pdf-textedit-input, .pdf-imgedit-layer, .pdf-imgedit-under, .pdf-del-popup',
                   )
                 )
                   setSelected(null)
@@ -3950,7 +5683,9 @@ export default function App() {
                     return (
                       <div
                         key={origIdx}
-                        className={`pdf-page${editTextMode && !readOnly ? ' pdf-editing-text' : ''}`}
+                        className={`pdf-page${editTextMode && !readOnly ? ' pdf-editing-text' : ''}${
+                          pendingTextInsert ? ' pdf-inserting-text' : ''
+                        }`}
                         style={
                           {
                             width: Math.floor(size.width * scale),
@@ -3958,23 +5693,41 @@ export default function App() {
                             '--scale-factor': scale,
                           } as CSSProperties
                         }
-                        onClick={
-                          editTextMode && !readOnly ? (e) => startTextEdit(origIdx, e) : undefined
-                        }
-                        onMouseMove={
-                          // move, not over: leaving the hover box across the static textLayer
-                          // background fires no over events; the handler early-returns while
-                          // the anchor span is unchanged so per-move cost is one closest()
-                          editTextMode && !readOnly ? (e) => updateLineHover(origIdx, e) : undefined
-                        }
-                        onMouseLeave={
-                          editTextMode && !readOnly
-                            ? () => {
-                                clearLineHover()
-                                clearBlockHover()
-                              }
-                            : undefined
-                        }
+                        onClick={(e) => {
+                          if (pendingTextInsert && !readOnly) {
+                            const pageBox = e.currentTarget.getBoundingClientRect()
+                            placeTextInsert(
+                              origIdx,
+                              (e.clientX - pageBox.left) / scale,
+                              (e.clientY - pageBox.top) / scale,
+                            )
+                          } else if (editTextMode && !readOnly) startTextEdit(origIdx, e)
+                          else handlePageClick(origIdx, e)
+                        }}
+                        onMouseMove={(e) => {
+                          if (pendingTextInsert && !readOnly) {
+                            const pageBox = e.currentTarget.getBoundingClientRect()
+                            setTextInsertPointer({
+                              pageIndex: origIdx,
+                              x: (e.clientX - pageBox.left) / scale,
+                              y: (e.clientY - pageBox.top) / scale,
+                            })
+                          } else if (editTextMode && !readOnly) {
+                            // move, not over: leaving the hover box across the static textLayer
+                            // background fires no over events; updateLineHover cheaply returns
+                            // while the anchor span is unchanged.
+                            updateLineHover(origIdx, e)
+                          }
+                        }}
+                        onMouseLeave={() => {
+                          setTextInsertPointer((pointer) =>
+                            pointer?.pageIndex === origIdx ? null : pointer,
+                          )
+                          if (editTextMode && !readOnly) {
+                            clearLineHover()
+                            clearBlockHover()
+                          }
+                        }}
                       >
                         <PdfPage
                           doc={doc}
@@ -3982,6 +5735,7 @@ export default function App() {
                           scale={scale}
                           rotationDelta={rotDelta(origIdx)}
                           visible={rowVisible}
+                          onRenderState={pageRenderState}
                         />
                         {livePreview.has(origIdx) &&
                           (() => {
@@ -4018,9 +5772,11 @@ export default function App() {
                             dispH={geomDispSize(geom).height}
                             scale={scale}
                             color={drawColor}
-                            title={t('imagePlaceHint')}
+                            title={
+                              pendingStaticFill ? t('formPlaceStaticHint') : t('imagePlaceHint')
+                            }
                             onPlace={(vx, vy) => placeImage(origIdx, vx, vy)}
-                            placeK={imagePlaceK}
+                            placeK={pendingStaticFill ? staticFormFillPlaceK : imagePlaceK}
                           />
                         )}
                         {/* Paragraph boxes (WPS-style): every text block outlined while
@@ -4045,6 +5801,95 @@ export default function App() {
                         )}
                         {rowVisible && (
                           <>
+                            {pendingTextInsert && textInsertPointer?.pageIndex === origIdx && (
+                              <div
+                                className="pdf-textinsert-placement-preview"
+                                style={{
+                                  left: textInsertPointer.x * scale,
+                                  top: (textInsertPointer.y - pendingTextInsert.fontSize) * scale,
+                                  fontSize: pendingTextInsert.fontSize * scale * 0.92,
+                                  lineHeight: pendingTextInsert.lineLeading
+                                    ? `${pendingTextInsert.lineLeading * scale}px`
+                                    : 1.2,
+                                  color: `rgb(${pendingTextInsert.color.join(', ')})`,
+                                  whiteSpace: 'pre',
+                                  transform:
+                                    pendingTextInsert.align === 'center'
+                                      ? 'translateX(-50%)'
+                                      : pendingTextInsert.align === 'right'
+                                        ? 'translateX(-100%)'
+                                        : undefined,
+                                  textAlign: pendingTextInsert.align ?? 'left',
+                                }}
+                              >
+                                {pendingTextInsert.text}
+                              </div>
+                            )}
+                            {textInserts
+                              .filter((insert) => insert.input.pageIndex === origIdx)
+                              .map((insert) => {
+                                const [vx, vy] = pdfToView(
+                                  geom,
+                                  insert.input.origin[0],
+                                  insert.input.origin[1],
+                                )
+                                const align = insert.input.align ?? 'left'
+                                const style: CSSProperties = {
+                                  left: vx * scale,
+                                  top: (vy - insert.input.fontSize) * scale,
+                                  fontSize: insert.input.fontSize * scale * 0.92,
+                                  lineHeight: insert.input.lineLeading
+                                    ? `${insert.input.lineLeading * scale}px`
+                                    : 1.2,
+                                  color: `rgb(${insert.input.color.join(', ')})`,
+                                  whiteSpace: 'pre',
+                                  transform:
+                                    align === 'center'
+                                      ? 'translateX(-50%)'
+                                      : align === 'right'
+                                        ? 'translateX(-100%)'
+                                        : undefined,
+                                  textAlign: align,
+                                }
+                                if (insert.input.font) {
+                                  style.fontFamily = EDIT_FONT_BY_ID.get(insert.input.font)?.css
+                                }
+                                if (insert.input.bold) style.fontWeight = 700
+                                if (insert.input.italic) style.fontStyle = 'italic'
+                                return (
+                                  <div
+                                    key={insert.id}
+                                    className={`pdf-textinsert-preview${
+                                      selected?.kind === 'textInsert' && selected.id === insert.id
+                                        ? ' is-selected'
+                                        : ''
+                                    }`}
+                                    style={style}
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      setSelected({
+                                        kind: 'textInsert',
+                                        id: insert.id,
+                                        ...popupPos(e.clientX, e.clientY),
+                                      })
+                                    }}
+                                    onDoubleClick={(e) => {
+                                      e.stopPropagation()
+                                      setSelected(null)
+                                      setPendingTextInsert(null)
+                                      setTextInsertEditId(insert.id)
+                                      setStaticTextPurpose('insert')
+                                      setStaticText(insert.input.text)
+                                      setStaticTextSize(insert.input.fontSize)
+                                      setStaticTextColor(rgb255ToHex(insert.input.color))
+                                      setStaticTextAlign(insert.input.align ?? 'left')
+                                      setStaticTextDialog(true)
+                                    }}
+                                  >
+                                    {insert.input.text}
+                                  </div>
+                                )
+                              })}
                             {/* Pending text edits: cover the original run and preview the replacement */}
                             {textEdits
                               .filter((te) => te.input.pageIndex === origIdx)
@@ -4062,6 +5907,8 @@ export default function App() {
                                 }
                                 if (te.input.newColor) {
                                   style.color = `rgb(${te.input.newColor.join(', ')})`
+                                } else if (te.baseInk) {
+                                  style.color = te.baseInk
                                 }
                                 if (te.input.newFont) {
                                   style.fontFamily = EDIT_FONT_BY_ID.get(te.input.newFont)?.css
@@ -4124,11 +5971,44 @@ export default function App() {
                                           : ''
                                       }`}
                                       style={style}
-                                      title={editTextMode ? t('editTextHint') : t('removeMarkup')}
+                                      data-tip={
+                                        editTextMode ? t('editTextHint') : t('removeMarkup')
+                                      }
                                       onClick={(e) => {
                                         e.stopPropagation()
                                         if (editTextMode && !readOnly) {
                                           draftSelectedRef.current = false
+                                          // A plain line edit inside a multi-line clustered
+                                          // paragraph reopens the whole paragraph with the
+                                          // pending change folded in — re-clicking edited
+                                          // text must not demote paragraph editing to that
+                                          // single line
+                                          if (isPlainLineEdit(te.input)) {
+                                            const r = te.input.rect
+                                            const cx = (r[0] + r[2]) / 2
+                                            const cy = (r[1] + r[3]) / 2
+                                            const block = pageBlocks
+                                              .get(origIdx)
+                                              ?.find(
+                                                (b) =>
+                                                  b.lines.length > 1 &&
+                                                  cx >= b.rect[0] &&
+                                                  cx <= b.rect[2] &&
+                                                  cy >= b.rect[1] &&
+                                                  cy <= b.rect[3],
+                                              )
+                                            if (
+                                              block &&
+                                              foldBlockValue(
+                                                origIdx,
+                                                block,
+                                                joinBlockLines(block.lines.map((l) => l.text)),
+                                              )
+                                            ) {
+                                              startBlockEdit(origIdx, block)
+                                              return
+                                            }
+                                          }
                                           // Block edits reopen as one logical paragraph (the
                                           // stored newText is the wrapped form); leading is
                                           // unscaled back to the original font size
@@ -4149,6 +6029,43 @@ export default function App() {
                                             ? (te.input.blockSource ??
                                               joinBlockLines(te.input.newText.split('\n')))
                                             : te.input.newText
+                                          // Unified selection model: the reopened draft's
+                                          // caret goes where the preview was clicked. The
+                                          // preview shows wrapped newText; the click's
+                                          // offset in its textContent maps onto the
+                                          // draft's logical value like a line-in-block.
+                                          {
+                                            const host = e.currentTarget
+                                            const cr = document.caretRangeFromPoint(
+                                              e.clientX,
+                                              e.clientY,
+                                            )
+                                            let pre: [number, number] | null = null
+                                            if (cr && host.contains(cr.startContainer)) {
+                                              let off = 0
+                                              const walk = document.createTreeWalker(
+                                                host,
+                                                NodeFilter.SHOW_TEXT,
+                                              )
+                                              for (
+                                                let n = walk.nextNode();
+                                                n;
+                                                n = walk.nextNode()
+                                              ) {
+                                                if (n === cr.startContainer) {
+                                                  pre = mapLineRangeToBlock(
+                                                    value,
+                                                    host.textContent ?? '',
+                                                    off + cr.startOffset,
+                                                    off + cr.startOffset,
+                                                  )
+                                                  break
+                                                }
+                                                off += (n.textContent ?? '').length
+                                              }
+                                            }
+                                            draftPreselectRef.current = pre
+                                          }
                                           // Selection colors are stored against the
                                           // committed newText; carry them back onto the
                                           // draft's logical text
@@ -4180,6 +6097,7 @@ export default function App() {
                                             italic: te.input.newItalic ? true : undefined,
                                             editId: te.id,
                                             cover: te.cover,
+                                            seedInk: te.baseInk,
                                             block: blk,
                                           })
                                         } else {
@@ -4313,7 +6231,7 @@ export default function App() {
                                         {editFonts.length > 0 && (
                                           <select
                                             className="pdf-textedit-fontsel"
-                                            title={t('texteditFont')}
+                                            data-tip={t('texteditFont')}
                                             value={textDraft.font ?? ''}
                                             onChange={(e) =>
                                               setTextDraft((d) =>
@@ -4334,7 +6252,7 @@ export default function App() {
                                           type="number"
                                           min={4}
                                           max={200}
-                                          title={t('watermarkSize')}
+                                          data-tip={t('watermarkSize')}
                                           value={
                                             textDraft.size ??
                                             Math.round(textDraft.fontSize * 10) / 10
@@ -4348,7 +6266,7 @@ export default function App() {
                                         />
                                         <button
                                           className={`pdf-textedit-toggle${textDraft.bold ? ' active' : ''}`}
-                                          title={t('texteditBold')}
+                                          data-tip={t('texteditBold')}
                                           onClick={() =>
                                             setTextDraft((d) =>
                                               d ? { ...d, bold: d.bold ? undefined : true } : d,
@@ -4361,7 +6279,7 @@ export default function App() {
                                           className={`pdf-textedit-toggle pdf-textedit-toggle-i${
                                             textDraft.italic ? ' active' : ''
                                           }`}
-                                          title={t('texteditItalic')}
+                                          data-tip={t('texteditItalic')}
                                           onClick={() =>
                                             setTextDraft((d) =>
                                               d ? { ...d, italic: d.italic ? undefined : true } : d,
@@ -4370,27 +6288,37 @@ export default function App() {
                                         >
                                           I
                                         </button>
-                                        {DRAW_COLORS.map((c) => (
+                                        <div className="pdf-text-color-wrap">
                                           <button
-                                            key={c.name}
-                                            className={`pdf-textedit-swatch${
-                                              textDraft.color === rgbToHex(c.rgb) ? ' active' : ''
+                                            type="button"
+                                            className={`pdf-color-trigger-compact${
+                                              textDraftColorOpen ? ' active' : ''
                                             }`}
-                                            style={{ background: cssRgb(c.rgb) }}
-                                            title={t('drawColor')}
-                                            onClick={() => applyDraftColor(rgbToHex(c.rgb), true)}
-                                          />
-                                        ))}
-                                        <label
-                                          className="pdf-textedit-more"
-                                          title={t('moreColors')}
-                                        >
-                                          <input
-                                            type="color"
-                                            value={textDraft.color ?? '#000000'}
-                                            onChange={(e) => applyDraftColor(e.target.value, false)}
-                                          />
-                                        </label>
+                                            aria-label={t('drawColor')}
+                                            data-tip={t('drawColor')}
+                                            onClick={() => setTextDraftColorOpen((open) => !open)}
+                                          >
+                                            <span
+                                              style={{
+                                                background: textDraft.color ?? '#000000',
+                                              }}
+                                            />
+                                          </button>
+                                          {textDraftColorOpen && (
+                                            <div className="pdf-color-picker-popup pdf-text-color-popup">
+                                              <ColorPalette
+                                                value={textDraft.color ?? '#000000'}
+                                                presets={DRAW_COLOR_PRESETS}
+                                                moreColorsLabel={t('moreColors')}
+                                                onChange={(value, source) => {
+                                                  applyDraftColor(value, source === 'preset')
+                                                  if (source === 'preset')
+                                                    setTextDraftColorOpen(false)
+                                                }}
+                                              />
+                                            </div>
+                                          )}
+                                        </div>
                                       </div>
                                       <textarea
                                         ref={draftTaRef}
@@ -4403,13 +6331,18 @@ export default function App() {
                                           ...(blk && blk.align !== 'left'
                                             ? { textAlign: blk.align }
                                             : {}),
-                                          // Document-content color (the user's pick), not chrome
-                                          ...(textDraft.color ? { color: textDraft.color } : {}),
+                                          // Document-content color (user's pick, else the
+                                          // document's own ink), not chrome
+                                          ...(textDraft.color || textDraft.seedInk
+                                            ? { color: textDraft.color ?? textDraft.seedInk }
+                                            : {}),
                                           ...(draftColors
                                             ? {
                                                 color: 'transparent',
                                                 caretColor:
-                                                  textDraft.color ?? 'var(--pdf-textedit-ink)',
+                                                  textDraft.color ??
+                                                  textDraft.seedInk ??
+                                                  'var(--pdf-textedit-ink)',
                                               }
                                             : {}),
                                           ...(draftCss ? { fontFamily: draftCss } : {}),
@@ -4421,7 +6354,15 @@ export default function App() {
                                         onFocus={(e) => {
                                           if (!draftSelectedRef.current) {
                                             draftSelectedRef.current = true
-                                            e.currentTarget.select()
+                                            const pre = draftPreselectRef.current
+                                            draftPreselectRef.current = null
+                                            const len = e.currentTarget.value.length
+                                            if (pre)
+                                              e.currentTarget.setSelectionRange(
+                                                Math.min(pre[0], len),
+                                                Math.min(pre[1], len),
+                                              )
+                                            else e.currentTarget.setSelectionRange(len, len)
                                           }
                                         }}
                                         onChange={(e) => {
@@ -4467,7 +6408,10 @@ export default function App() {
                                             ...(blk && blk.align !== 'left'
                                               ? { textAlign: blk.align }
                                               : {}),
-                                            color: textDraft.color ?? 'var(--pdf-textedit-ink)',
+                                            color:
+                                              textDraft.color ??
+                                              textDraft.seedInk ??
+                                              'var(--pdf-textedit-ink)',
                                             ...(draftCss ? { fontFamily: draftCss } : {}),
                                             ...(textDraft.bold ? { fontWeight: 700 } : {}),
                                             ...(textDraft.italic ? { fontStyle: 'italic' } : {}),
@@ -4490,6 +6434,10 @@ export default function App() {
                                 )
                               })()}
                             {(imageEdits.some((ie) => ie.input.pageIndex === origIdx) ||
+                              (ribbonTab === 'fillForm' &&
+                                savedStaticFormFills.some(
+                                  (record) => record.pageIndex === origIdx,
+                                )) ||
                               (editImageMode &&
                                 pageImages.some((ref) => ref.pageIndex === origIdx))) && (
                               <div
@@ -4503,17 +6451,30 @@ export default function App() {
                                   geom={geom}
                                   scale={scale}
                                   edits={imageEdits.filter((ie) => ie.input.pageIndex === origIdx)}
-                                  existing={
-                                    editImageMode
-                                      ? pageImages.filter(
-                                          (ref) =>
-                                            ref.pageIndex === origIdx &&
-                                            !claimedImageKeys.has(
-                                              `${ref.pageIndex}:${imageRectKey(ref.rect)}`,
-                                            ),
-                                        )
-                                      : []
-                                  }
+                                  existing={[
+                                    ...(editImageMode
+                                      ? pageImages.filter((ref) => ref.pageIndex === origIdx)
+                                      : []),
+                                    ...(ribbonTab === 'fillForm'
+                                      ? savedStaticFormFills
+                                          .filter((record) => record.pageIndex === origIdx)
+                                          .map((record): PageImageRef => ({
+                                            pageIndex: record.pageIndex,
+                                            rect: record.rect,
+                                            aboveText: true,
+                                          }))
+                                      : []),
+                                  ].filter(
+                                    (ref, index, refs) =>
+                                      !claimedImageKeys.has(
+                                        `${ref.pageIndex}:${imageRectKey(ref.rect)}`,
+                                      ) &&
+                                      refs.findIndex(
+                                        (candidate) =>
+                                          candidate.pageIndex === ref.pageIndex &&
+                                          rectsNear(candidate.rect, ref.rect),
+                                      ) === index,
+                                  )}
                                   selectedId={selected?.kind === 'imageEdit' ? selected.id : null}
                                   selectedKey={
                                     selected?.kind === 'pageImage' &&
@@ -4549,7 +6510,7 @@ export default function App() {
                                 className={`pdf-stamp-preview${selected?.kind === 'stamp' ? ' pdf-stamp-selected' : ''}`}
                                 src={`data:image/png;base64,${s.image}`}
                                 alt=""
-                                title={t('removeStamp')}
+                                data-tip={t('removeStamp')}
                                 style={{
                                   ...pdfRectToCss(geom, s.rect, scale),
                                   opacity: s.opacity ?? 1,
@@ -4579,11 +6540,18 @@ export default function App() {
                               geom={geom}
                               scale={scale}
                               selectedId={selected?.kind === 'markup' ? selected.id : null}
-                              selectTitle={t('removeMarkup')}
-                              onSelect={(id, x, y) =>
-                                setSelected({ kind: 'markup', id, ...popupPos(x, y) })
-                              }
                             />
+                            {/* Selection outline for a saved markup annotation (the markup
+                                itself is painted in the canvas raster) */}
+                            {selected?.kind === 'savedMarkup' &&
+                              selected.annot.pageIndex === origIdx &&
+                              selected.annot.quads.map((q, i) => (
+                                <div
+                                  key={i}
+                                  className="pdf-markup pdf-markup-selected"
+                                  style={pdfRectToCss(geom, quadToRect(q), scale)}
+                                />
+                              ))}
                             <DrawLayer
                               geom={geom}
                               scale={scale}
@@ -4614,12 +6582,20 @@ export default function App() {
                               onGoToDest={(dest) => void goToDest(dest)}
                             />
                             <FormLayer
-                              doc={doc}
-                              pageNo={origIdx + 1}
+                              widgets={formCatalog?.byPage.get(origIdx) ?? []}
                               geom={geom}
                               scale={scale}
                               readOnly={readOnly}
                               edits={formEdits}
+                              activeWidgetId={activeFormWidgetId}
+                              signedWidgetIds={signedFormWidgetIds}
+                              signatureLabel={t('formSignField')}
+                              registerControl={registerFormControl}
+                              onFocus={(widget) => {
+                                setActiveFormWidgetId(widget.id)
+                                setRibbonTab('fillForm')
+                              }}
+                              onSignature={(widget) => openSignatureDialog(widget)}
                               onEdit={(v2) => {
                                 pushUndo(`form:${v2.name}`)
                                 setFormEdits((prev) => new Map(prev).set(v2.name, v2))
@@ -4658,7 +6634,8 @@ export default function App() {
                 </span>
                 <button
                   className="rb-icon"
-                  title={t('searchPrev')}
+                  data-tip={t('searchPrev')}
+                  aria-label={t('searchPrev')}
                   disabled={activeMatches.length === 0}
                   onClick={() => searchStep(-1)}
                 >
@@ -4666,7 +6643,8 @@ export default function App() {
                 </button>
                 <button
                   className="rb-icon"
-                  title={t('searchNext')}
+                  data-tip={t('searchNext')}
+                  aria-label={t('searchNext')}
                   disabled={activeMatches.length === 0}
                   onClick={() => searchStep(1)}
                 >
@@ -4685,21 +6663,33 @@ export default function App() {
               >
                 <button
                   type="button"
-                  title={t('highlight')}
+                  className={activeMarkupTypes.has('highlight') ? 'is-active' : undefined}
+                  data-tip={activeMarkupTypes.has('highlight') ? t('removeMarkup') : t('highlight')}
+                  aria-label={
+                    activeMarkupTypes.has('highlight') ? t('removeMarkup') : t('highlight')
+                  }
                   onClick={() => applyMarkup('highlight')}
                 >
                   <span className="sel-swatch sel-swatch-hl" />
                 </button>
                 <button
                   type="button"
-                  title={t('underline')}
+                  className={activeMarkupTypes.has('underline') ? 'is-active' : undefined}
+                  data-tip={activeMarkupTypes.has('underline') ? t('removeMarkup') : t('underline')}
+                  aria-label={
+                    activeMarkupTypes.has('underline') ? t('removeMarkup') : t('underline')
+                  }
                   onClick={() => applyMarkup('underline')}
                 >
                   <span className="sel-swatch sel-swatch-ul">U</span>
                 </button>
                 <button
                   type="button"
-                  title={t('strikeout')}
+                  className={activeMarkupTypes.has('strikeout') ? 'is-active' : undefined}
+                  data-tip={activeMarkupTypes.has('strikeout') ? t('removeMarkup') : t('strikeout')}
+                  aria-label={
+                    activeMarkupTypes.has('strikeout') ? t('removeMarkup') : t('strikeout')
+                  }
                   onClick={() => applyMarkup('strikeout')}
                 >
                   <span className="sel-swatch sel-swatch-st">S</span>
@@ -4712,26 +6702,101 @@ export default function App() {
                 style={{ left: selected.x, top: selected.y }}
                 onMouseDown={(e) => e.preventDefault()}
               >
+                {selectedStaticTextTarget() && (
+                  <>
+                    <button
+                      type="button"
+                      data-tip={t('formEditText')}
+                      aria-label={t('formEditText')}
+                      onClick={startEditStaticText}
+                    >
+                      <IconFormText />
+                    </button>
+                    <span className="pdf-del-popup-sep" />
+                  </>
+                )}
                 {selectedImageLayer() !== null && (
                   <>
                     <button
                       type="button"
-                      title={t('imageRotateCw')}
+                      data-tip={t('imageRotateCw')}
+                      aria-label={t('imageRotateCw')}
                       onClick={() => rotateSelected(1)}
                     >
                       <IconRotateCw />
                     </button>
                     <button
                       type="button"
-                      title={t('imageRotateCcw')}
+                      data-tip={t('imageRotateCcw')}
+                      aria-label={t('imageRotateCcw')}
                       onClick={() => rotateSelected(-1)}
                     >
                       <IconRotateCcw />
                     </button>
-                    {selected.kind === 'pageImage' && (
-                      <button type="button" title={t('imageReplace')} onClick={startReplaceImage}>
-                        <IconSwapImage />
-                      </button>
+                    <button
+                      type="button"
+                      data-tip={t('imageFlipH')}
+                      aria-label={t('imageFlipH')}
+                      onClick={() => flipSelected('h')}
+                    >
+                      <IconFlipH />
+                    </button>
+                    <button
+                      type="button"
+                      data-tip={t('imageFlipV')}
+                      aria-label={t('imageFlipV')}
+                      onClick={() => flipSelected('v')}
+                    >
+                      <IconFlipV />
+                    </button>
+                    <span className="pdf-del-popup-sep" />
+                    <button
+                      type="button"
+                      data-tip={t('imageCrop')}
+                      aria-label={t('imageCrop')}
+                      onClick={() => openImageDialog('crop')}
+                    >
+                      <IconCrop />
+                    </button>
+                    <button
+                      type="button"
+                      data-tip={t('imageCutout')}
+                      aria-label={t('imageCutout')}
+                      onClick={() => openImageDialog('cutout')}
+                    >
+                      <IconCutout />
+                    </button>
+                    <button
+                      type="button"
+                      data-tip={t('imageOpacity')}
+                      aria-label={t('imageOpacity')}
+                      onClick={() => setOpacityMenu((v) => !v)}
+                    >
+                      <IconOpacity />
+                    </button>
+                    <button
+                      type="button"
+                      data-tip={t('imageReplace')}
+                      aria-label={t('imageReplace')}
+                      onClick={startReplaceImage}
+                    >
+                      <IconSwapImage />
+                    </button>
+                    {opacityMenu && (
+                      <div className="pdf-opacity-menu">
+                        {[0, 15, 30, 50, 65, 80, 95].map((p) => (
+                          <button
+                            key={p}
+                            type="button"
+                            onClick={() => {
+                              setOpacityMenu(false)
+                              applyImageOpacity(p)
+                            }}
+                          >
+                            {p}%
+                          </button>
+                        ))}
+                      </div>
                     )}
                     <span className="pdf-del-popup-sep" />
                     <button type="button" onClick={toggleImageLayer}>
@@ -4750,14 +6815,16 @@ export default function App() {
                   {t(
                     selected.kind === 'pageImage' || selected.kind === 'imageEdit'
                       ? 'deleteImage'
-                      : 'deleteAnnotation',
+                      : selected.kind === 'textInsert'
+                        ? 'deleteInsertedText'
+                        : 'deleteAnnotation',
                   )}
                 </button>
               </div>
             )}
             {deleteToast && (
               <div className="pdf-toast">
-                <span>{t('annotationDeleted')}</span>
+                <span>{t(deletedInsertedText ? 'insertedTextDeleted' : 'annotationDeleted')}</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -4825,6 +6892,28 @@ export default function App() {
             {stampDlg && (
               <StampDialog t={t} onCancel={() => setStampDlg(false)} onApply={applyStamps} />
             )}
+            {imageDialog?.kind === 'crop' && (
+              <CropDialog
+                t={t}
+                image={imageDialog.image}
+                onCancel={() => setImageDialog(null)}
+                onApply={(png, crop) => {
+                  setImageDialog(null)
+                  commitBaked(imageDialog.target, png, crop)
+                }}
+              />
+            )}
+            {imageDialog?.kind === 'cutout' && (
+              <CutoutDialog
+                t={t}
+                image={imageDialog.image}
+                onCancel={() => setImageDialog(null)}
+                onApply={(png) => {
+                  setImageDialog(null)
+                  commitBaked(imageDialog.target, png)
+                }}
+              />
+            )}
             {propsDlg && (
               <PropertiesDialog
                 doc={doc}
@@ -4846,12 +6935,123 @@ export default function App() {
               <SignatureDialog
                 color={drawColor}
                 t={t}
-                onCancel={() => setSignDlg(false)}
+                onCancel={() => {
+                  setSignDlg(false)
+                  setSignatureTarget(null)
+                }}
                 onConfirm={(sig) => {
                   setSignDlg(false)
-                  setPendingSign(sig)
+                  if (signatureTarget) placeSignatureInField(sig, signatureTarget)
+                  else setPendingSign(sig)
                 }}
               />
+            )}
+            {staticTextDialog && (
+              <div
+                className="pdf-modal-mask"
+                onClick={() => {
+                  setStaticTextDialog(false)
+                  setStaticTextEditTarget(null)
+                  setTextInsertEditId(null)
+                }}
+              >
+                <div className="pdf-modal" onClick={(e) => e.stopPropagation()}>
+                  <div className="pdf-modal-title">
+                    {t(
+                      staticTextPurpose === 'insert'
+                        ? textInsertEditId
+                          ? 'editInsertedText'
+                          : 'insertTextTitle'
+                        : staticTextEditTarget
+                          ? 'formEditText'
+                          : 'formAddTextTitle',
+                    )}
+                  </div>
+                  <textarea
+                    className="pdf-modal-textarea"
+                    value={staticText}
+                    placeholder={t('formAddTextPlaceholder')}
+                    autoFocus
+                    onChange={(e) => setStaticText(e.target.value)}
+                  />
+                  <label className="pdf-field">
+                    <span>{t('formTextSize')}</span>
+                    <input
+                      className="pdf-modal-input"
+                      type="number"
+                      min={6}
+                      max={72}
+                      value={staticTextSize}
+                      onChange={(e) =>
+                        setStaticTextSize(Math.min(72, Math.max(6, Number(e.target.value) || 14)))
+                      }
+                    />
+                  </label>
+                  <div className="pdf-field-grid">
+                    <div className="pdf-field pdf-color-field">
+                      <span>{t('formTextColor')}</span>
+                      <button
+                        type="button"
+                        className="pdf-color-trigger"
+                        aria-expanded={staticTextColorOpen}
+                        onClick={() => setStaticTextColorOpen((open) => !open)}
+                      >
+                        <span
+                          className="pdf-color-trigger-swatch"
+                          style={{ background: staticTextColor }}
+                        />
+                        <span>{staticTextColor.toUpperCase()}</span>
+                      </button>
+                      {staticTextColorOpen && (
+                        <div className="pdf-color-picker-popup pdf-form-color-popup">
+                          <ColorPalette
+                            value={staticTextColor}
+                            presets={TEXT_COLOR_PICKER_PRESETS}
+                            moreColorsLabel={t('moreColors')}
+                            onChange={(value, source) => {
+                              setStaticTextColor(value.toLowerCase())
+                              if (source === 'preset') setStaticTextColorOpen(false)
+                            }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                    <label className="pdf-field">
+                      <span>{t('formTextAlign')}</span>
+                      <select
+                        className="pdf-modal-input"
+                        value={staticTextAlign}
+                        onChange={(e) =>
+                          setStaticTextAlign(e.target.value as 'left' | 'center' | 'right')
+                        }
+                      >
+                        <option value="left">{t('formAlignLeft')}</option>
+                        <option value="center">{t('formAlignCenter')}</option>
+                        <option value="right">{t('formAlignRight')}</option>
+                      </select>
+                    </label>
+                  </div>
+                  <div className="pdf-modal-actions">
+                    <button
+                      className="pdf-modal-btn"
+                      onClick={() => {
+                        setStaticTextDialog(false)
+                        setStaticTextEditTarget(null)
+                        setTextInsertEditId(null)
+                      }}
+                    >
+                      {t('cancel')}
+                    </button>
+                    <button
+                      className="pdf-modal-btn primary"
+                      disabled={!staticText.trim()}
+                      onClick={confirmStaticFormText}
+                    >
+                      {t('ok')}
+                    </button>
+                  </div>
+                </div>
+              </div>
             )}
             {notePrompt && (
               <div className="pdf-modal-mask" onClick={() => setNotePrompt(null)}>
@@ -4921,7 +7121,12 @@ export default function App() {
               </span>
             </div>
             <div className="status-right">
-              <button className="zoom-btn" title={t('zoomOut')} onClick={zoomOut}>
+              <button
+                className="zoom-btn"
+                data-tip={t('zoomOut')}
+                aria-label={t('zoomOut')}
+                onClick={zoomOut}
+              >
                 −
               </button>
               <input
@@ -4933,7 +7138,12 @@ export default function App() {
                 value={Math.round(scale * 100)}
                 onChange={(e) => applyScale(Number(e.target.value) / 100, null)}
               />
-              <button className="zoom-btn" title={t('zoomIn')} onClick={zoomIn}>
+              <button
+                className="zoom-btn"
+                data-tip={t('zoomIn')}
+                aria-label={t('zoomIn')}
+                onClick={zoomIn}
+              >
                 +
               </button>
               <span className="zoom-value">{Math.round(scale * 100)}%</span>

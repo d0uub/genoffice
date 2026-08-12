@@ -234,9 +234,11 @@ import { installCellFilenameFunction } from './cell-function'
 import { installFormulaLexerFix } from './formula-lexer-fix'
 import { installSheetRenameFix } from './sheet-rename-fix'
 import { installSelectionWrapGuard } from './selection-wrap-fix'
+import { installMultiRowAutofit } from './autofit-multi-row'
 import { installCopyMaterialize } from './copy-materialize'
 import { applyUniverLocale } from './univer-locales'
 import { installRuleDetail } from './univer-rule-detail'
+import { installPopulatedDataValidationArrow } from './data-validation-arrow'
 import { installFormulaNullResultFix } from './formula-null-result'
 import { installNumberFormatFix } from './numfmt-fix'
 import { installRateFallback } from './rate-function'
@@ -324,6 +326,8 @@ export function App(): React.JSX.Element {
   const adapterRef = useRef(new InMemoryWorkbookAdapter(initialSnapshot))
   const univerRef = useRef<UniverRuntime | null>(null)
   const lazyWorkbookRef = useRef<LazyWorkbookState | null>(null)
+  /// Univer undo/redo stack occupancy (subscribed at mount): drives the QAT button gray states
+  const [univerHist, setUniverHist] = useState({ canUndo: false, canRedo: false })
   /// True while Univer's in-cell editor is open (AutoSave must not save-reload then).
   const editingCellRef = useRef(false)
   const visualDisposablesRef = useRef<{ dispose(): void }[]>([])
@@ -590,6 +594,16 @@ export function App(): React.JSX.Element {
   const [attachNotice, setAttachNotice] = useState<string | null>(null)
   const attachmentsRef = useRef(attachments)
   attachmentsRef.current = attachments
+  /** Attachments consumed by earlier sends this session: sending clears the composer, but the
+      files skill must keep reading them mid-run and in follow-up turns. Deduped by path. */
+  const sentAttachmentsRef = useRef<readonly AttachmentMeta[]>([])
+  /** composer attachments plus everything already sent this session (deduped by path) */
+  const availableAttachments = (): AttachmentMeta[] => {
+    const seen = new Set<string>()
+    return [...sentAttachmentsRef.current, ...attachmentsRef.current].filter((a) =>
+      seen.has(a.path) ? false : (seen.add(a.path), true),
+    )
+  }
   /** Synchronous re-entrancy guard between runAgent trigger and loop.run
    * (loop.busy is still false while attachment images load asynchronously) */
   const runStartingRef = useRef(false)
@@ -720,6 +734,19 @@ export function App(): React.JSX.Element {
                 ...(t.name ? { name: t.name } : {}),
                 ...(t.output ? { output: t.output.slice(0, 2000) } : {}),
               })) ?? [],
+            // stored metadata only: no thumbnail read for history, the chips render name/size
+            ...(m.attachments && m.attachments.length > 0
+              ? {
+                  attachments: m.attachments
+                    .filter((a) => a.path)
+                    .map((a) => ({
+                      name: a.name,
+                      path: a.path ?? '',
+                      ext: a.ext ?? '',
+                      sizeBytes: a.sizeBytes ?? 0,
+                    })),
+                }
+              : {}),
           })),
         )
         // Restore model context: follow-ups after reopening the file continue the
@@ -741,6 +768,7 @@ export function App(): React.JSX.Element {
       input?: string
       output?: string
     }>,
+    attachments?: readonly AttachmentMeta[],
   ) => {
     const ids = chatRefIdsRef.current
     const api = (window as Window & { projectApi?: typeof window.projectApi }).projectApi
@@ -753,6 +781,16 @@ export function App(): React.JSX.Element {
         text,
         ...(tools && tools.length > 0
           ? { tools: tools.map((t) => ({ ...t, name: t.name ?? '' })) }
+          : {}),
+        ...(attachments && attachments.length > 0
+          ? {
+              attachments: attachments.map((a) => ({
+                name: a.name,
+                path: a.path,
+                ext: a.ext,
+                sizeBytes: a.sizeBytes,
+              })),
+            }
           : {}),
       })
       .catch(() => {
@@ -796,7 +834,7 @@ export function App(): React.JSX.Element {
       systemSuffix: aiLangDirective,
       skill: composeSkills('sheets+files', '', [
         createWorkbookSkill(sheetsSkillDeps()),
-        createFilesSkill(() => attachmentsRef.current),
+        createFilesSkill(availableAttachments),
         createSearchSkill(),
       ]),
       // guide loading adds a tool round; the default 8 cuts off multi-step work
@@ -804,7 +842,9 @@ export function App(): React.JSX.Element {
       events: {
         onText: (text) => {
           if (text) runLastTextRef.current = text
-          setMessage(text || t('appAiThinking'))
+          // Status bar (and the ribbon-row status span) show a short state only;
+          // the full streamed prose lives in the chat panel.
+          setMessage(t('appAiThinking'))
           // When the model retries successfully and keeps streaming after a
           // mid-run failure (e.g. one apply error), clear the error flag —
           // otherwise the whole successful message stays rendered in red.
@@ -889,7 +929,7 @@ export function App(): React.JSX.Element {
           const finalText = turnLimit
             ? [prose, t('appAiTurnLimit')].filter(Boolean).join('\n\n')
             : prose || fallback
-          setMessage(finalText)
+          setMessage(cancelled ? t('appAiStopped') : t('appAiDone'))
           patchLastAssistant((entry) => ({
             ...entry,
             text: finalText,
@@ -965,8 +1005,8 @@ export function App(): React.JSX.Element {
   /** Image attachments read as base64 and sent multimodal with this user message
    * (≤5MB each, max 20; same structure as docs/slides) */
   const MAX_IMAGES_PER_MESSAGE = 20
-  async function collectImageAttachments(): Promise<AgentImage[]> {
-    const imageAtts = attachmentsRef.current.filter((a) => ATTACHMENT_IMAGE_EXTS.has(a.ext))
+  async function collectImageAttachments(atts: readonly AttachmentMeta[]): Promise<AgentImage[]> {
+    const imageAtts = atts.filter((a) => ATTACHMENT_IMAGE_EXTS.has(a.ext))
     const images: AgentImage[] = []
     const failures: string[] = []
     for (const att of imageAtts.slice(0, MAX_IMAGES_PER_MESSAGE)) {
@@ -987,7 +1027,7 @@ export function App(): React.JSX.Element {
     return images
   }
 
-  function runAgent(instruction: string): void {
+  function runAgent(instruction: string, sentAttachments: readonly AttachmentMeta[]): void {
     const loop = agentLoopRef.current
     if (!instruction.trim() || !loop || loop.busy || runStartingRef.current) return
     runStartingRef.current = true
@@ -997,7 +1037,7 @@ export function App(): React.JSX.Element {
     setAiBusy(true)
     setMessage(t('appAiThinking'))
     appendChat({ role: 'assistant', text: '', tools: [], streaming: true })
-    void collectImageAttachments()
+    void collectImageAttachments(sentAttachments)
       .then((images) => {
         runStartingRef.current = false
         loop.run(instruction, images)
@@ -1048,6 +1088,7 @@ export function App(): React.JSX.Element {
     setAiBusy(false)
     setChat([])
     setHistoricChat([])
+    sentAttachmentsRef.current = []
     setPreview(null)
     lazyPreviewRef.current = null
     setMessage(t('appNewConversation'))
@@ -1172,6 +1213,29 @@ export function App(): React.JSX.Element {
     const applyUniverDark = () => themeService.setDarkMode(isDarkTheme())
     const offThemeChanged = window.desktopApi?.onThemeChanged?.(applyUniverDark)
     prefersDark.addEventListener('change', applyUniverDark)
+    // Undo/redo stack occupancy: the QAT buttons grey out when there is nothing to apply
+    const undoRedoService = runtime.univer.__getInjector().get(IUndoRedoService)
+    const undoRedoSub = undoRedoService.undoRedoStatus$.subscribe(
+      ({ undos, redos }: { undos: number; redos: number }) =>
+        setUniverHist({ canUndo: undos > 0, canRedo: redos > 0 }),
+    )
+    // Programmatic installs (viewport streaming, file loads, merges, row
+    // heights, notes, CF/filter rules) run through the same undoable commands
+    // as user edits; they all raise journalSuppression, so drop their undo
+    // entries there too — a freshly opened workbook starts with an empty
+    // stack and undo can never strip loaded file content or layout.
+    const originalPushUndoRedo = undoRedoService.pushUndoRedo.bind(undoRedoService)
+    undoRedoService.pushUndoRedo = (item) => {
+      if (!journalSuppression.active) originalPushUndoRedo(item)
+    }
+    // IUndoRedoService is registered lazily, so the injector hands out a redi
+    // proxy that caches a bound copy of each method on first read — and the
+    // initial snapshot load above reads pushUndoRedo before this wrapper is
+    // assigned. The assignment lands on the real instance, but every caller
+    // resolves the service through the same proxy and keeps getting the stale
+    // cached original. Deleting the key clears that per-proxy cache so the
+    // next read re-binds to the wrapper.
+    Reflect.deleteProperty(undoRedoService, 'pushUndoRedo')
     // The window always starts blank now; still consume the one-shot
     // new-blank flag so it doesn't leak into the next workbook open.
     void window.desktopApi?.consumeNewBlankWorkbook?.()
@@ -1231,12 +1295,16 @@ export function App(): React.JSX.Element {
     const sheetRenameFixDisposable = installSheetRenameFix()
     // Arrow keys stop at the sheet edge instead of wrapping to the far side.
     const selectionWrapGuardDisposable = installSelectionWrapGuard(runtime)
+    // Row-header double-click autofits every selected row, like Excel.
+    const multiRowAutofitDisposable = installMultiRowAutofit(runtime)
     // Empty-value formula results (IFERROR/IF/CHOOSE over blank refs)
     // display as 0 like Excel.
     const nullResultDisposable = installFormulaNullResultFix(runtime)
     // Copy/cut load their selection into the lazy window first so streamed
     // workbooks don't serialize blanks for never-viewed rows.
     const copyMaterializeDisposable = installCopyMaterialize(runtime, lazyWorkbookRef, setMessage)
+    // List-validation arrows stay discoverable on values without cluttering empty template rows.
+    const dataValidationArrowDisposable = installPopulatedDataValidationArrow(runtime)
     // Univer's own UI (rule-management panels, dialogs) follows the app
     // language instead of hard-coded English.
     void applyUniverLocale(runtime, getLang())
@@ -2033,6 +2101,10 @@ export function App(): React.JSX.Element {
       unsubscribeMenu()
       unsubscribeCloseSave()
       offThemeChanged?.()
+      undoRedoSub.unsubscribe()
+      undoRedoService.pushUndoRedo = originalPushUndoRedo
+      // clear the proxy's cached bound wrapper (see the install site)
+      Reflect.deleteProperty(undoRedoService, 'pushUndoRedo')
       prefersDark.removeEventListener('change', applyUniverDark)
       dateTextDisposable.dispose()
       filteredCopyDisposable.dispose()
@@ -2045,8 +2117,10 @@ export function App(): React.JSX.Element {
       formulaLexerFixDisposable.dispose()
       sheetRenameFixDisposable.dispose()
       selectionWrapGuardDisposable.dispose()
+      multiRowAutofitDisposable.dispose()
       nullResultDisposable.dispose()
       copyMaterializeDisposable.dispose()
+      dataValidationArrowDisposable.dispose()
       ruleDetailDisposable()
       scrollDisposable.dispose()
       zoomDisposable.dispose()
@@ -2075,18 +2149,40 @@ export function App(): React.JSX.Element {
     }
   }, [])
 
-  function handleSend(overrideInstruction?: string): void {
+  function handleSend(
+    overrideInstruction?: string,
+    overrideAttachments?: readonly AttachmentMeta[],
+  ): void {
     const instruction = (overrideInstruction ?? prompt).trim()
     if (!instruction || aiBusy) return
     runToolsRef.current = []
-    appendChat({ role: 'user', text: instruction, tools: [] })
-    persistChatMessage('user', instruction)
+    // The message consumes the composer attachments: they ride along (echoed on the
+    // bubble, images multimodal, files via the files skill) and the composer clears.
+    // Retry passes the failed message's original set instead.
+    const sentAtts = overrideAttachments ?? attachmentsRef.current
+    const agentConfigured = isAgentConfigured()
+    appendChat({
+      role: 'user',
+      text: instruction,
+      tools: [],
+      ...(sentAtts.length > 0 ? { attachments: sentAtts } : {}),
+    })
+    persistChatMessage('user', instruction, undefined, sentAtts)
     if (!overrideInstruction) setPrompt('')
+    // the deterministic path consumes the composer too — the bubble already echoes the set
+    if (!overrideAttachments && sentAtts.length > 0) {
+      const seen = new Set(sentAttachmentsRef.current.map((a) => a.path))
+      sentAttachmentsRef.current = [
+        ...sentAttachmentsRef.current,
+        ...sentAtts.filter((a) => !seen.has(a.path)),
+      ]
+      setAttachments([])
+    }
     // real LLM configured → let the agent read context and propose operations;
     // otherwise fall back to the local, deterministic regex planner
     // (kept for offline use and for the fixed micro-DSL it still supports).
-    if (isAgentConfigured()) {
-      runAgent(instruction)
+    if (agentConfigured) {
+      runAgent(instruction, sentAtts)
       return
     }
     const outcome = runDeterministicPlan(instruction)
@@ -2680,7 +2776,15 @@ export function App(): React.JSX.Element {
   }
 
   refreshSelectionFormatRef.current = () => {
-    const range = univerRef.current?.univerAPI.getActiveWorkbook()?.getActiveRange()
+    let range: ReturnType<ActiveWorkbook['getActiveRange']> | undefined
+    try {
+      range = univerRef.current?.univerAPI.getActiveWorkbook()?.getActiveRange()
+    } catch {
+      // Sheet changes briefly retain the previous sheet's selection. If that
+      // row or column is outside the new sheet, Univer rejects the stale
+      // range; the next selection event will refresh the ribbon normally.
+      return
+    }
     if (!range) {
       setSelectionFormat(null)
       setActiveCellA1('')
@@ -3110,6 +3214,8 @@ export function App(): React.JSX.Element {
         onStop={handleStopAgent}
         onNewChat={handleNewChat}
         onUndo={handleUndo}
+        canUndo={lazyWorkbookRef.current ? univerHist.canUndo : adapterRef.current.canUndo}
+        canRedo={univerHist.canRedo}
         onCommand={handleRibbonCommand}
         zoomPercent={zoomPercent}
         canSave={pendingEdits > 0}

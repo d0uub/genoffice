@@ -91,6 +91,8 @@ function formatAttrs(format: ParaFormat | undefined): Record<string, unknown> {
     dropCap: format?.dropCap ? JSON.stringify(format.dropCap) : null,
     bidi: format?.bidi ?? false,
     autoSpace: format?.autoSpace ?? null,
+    snapToGrid: format?.snapToGrid ?? null,
+    emptyRunSize: format?.emptyRunSizeHalfPoints ?? null,
   }
 }
 
@@ -203,12 +205,15 @@ function blockToPmNode(block: Block, rowCapTwips: number | null = null): PmNode 
           docxIndex: block.docxIndex,
           blockRevision: block.blockRevision ?? null,
           blockType: block.type,
+          styleId: block.styleId ?? null,
           label: block.label ?? block.type,
           previewText: block.previewText ?? '',
           imageDataUrl: block.imageDataUrl ?? null,
           oleProgId: block.oleProgId ?? null,
           imageWidthPx: block.imageWidthPx ?? null,
           imageHeightPx: block.imageHeightPx ?? null,
+          imageCrop: block.imageCrop ?? null,
+          imageFillRect: block.imageFillRect ?? null,
           imageAlign: block.imageAlign ?? null,
           imageWrap: block.imageWrap ?? null,
           imageOffsetXEmu: block.imageOffsetXEmu ?? null,
@@ -223,6 +228,7 @@ function blockToPmNode(block: Block, rowCapTwips: number | null = null): PmNode 
               ? capTableRowHeights(block.table, rowCapTwips)
               : (block.table ?? null),
           fieldDisplay: block.fieldDisplay ?? null,
+          diagramDisplay: block.diagramDisplay ?? null,
           decorative: block.decorative ?? false,
           ruleColorHex: block.ruleColorHex ?? null,
           ruleThicknessPx: block.ruleThicknessPx ?? null,
@@ -732,6 +738,7 @@ function runMarks(run: Run): PmMark[] {
     run.charSpacingTwips ||
     run.charScalePct ||
     run.highlight ||
+    run.shading ||
     run.vertAlign ||
     run.em ||
     run.styleId ||
@@ -743,12 +750,14 @@ function runMarks(run: Run): PmMark[] {
         color: run.color ?? null,
         sizeHalfPoints: run.sizeHalfPoints ?? null,
         font: run.font ?? null,
+        eaSlotEmpty: run.eaSlotEmpty ?? null,
         fontAscii: run.fontAscii ?? null,
         // cs chain only kicks in for complex-script text (Word's w:cs semantics)
         csFont: run.csFont && textHasComplexScript(run.text) ? run.csFont : null,
         charSpacingTwips: run.charSpacingTwips ?? null,
         charScaleEm: run.charScalePct ? charScaleEm(run.text, run.charScalePct) : null,
         highlight: run.highlight ?? null,
+        shading: run.shading ?? null,
         vertAlign: run.vertAlign ?? null,
         em: run.em ?? null,
         styleId: run.styleId ?? null,
@@ -1561,6 +1570,7 @@ function nodeFormat(node: PmNode): ParaFormat | undefined {
       /* ignore malformed */
     }
   }
+  if (node.attrs?.emptyRunSize) format.emptyRunSizeHalfPoints = Number(node.attrs.emptyRunSize)
   return Object.keys(format).length > 0 ? format : undefined
 }
 
@@ -1753,6 +1763,7 @@ export function inlineToRuns(content: PmNode[]): Run[] {
         if (mark.attrs?.csFont) run.csFont = String(mark.attrs.csFont)
         if (mark.attrs?.charSpacingTwips) run.charSpacingTwips = Number(mark.attrs.charSpacingTwips)
         if (mark.attrs?.highlight) run.highlight = String(mark.attrs.highlight)
+        if (mark.attrs?.shading) run.shading = String(mark.attrs.shading)
         if (mark.attrs?.vertAlign === 'superscript' || mark.attrs?.vertAlign === 'subscript') {
           run.vertAlign = mark.attrs.vertAlign
         }
@@ -1810,6 +1821,7 @@ function runStyleKey(run: Run): string {
     run.font ?? null,
     run.fontAscii ?? null,
     run.highlight ?? null,
+    run.shading ?? null,
     run.vertAlign ?? null,
     run.link?.href ?? null,
     run.link?.rId ?? null,
@@ -1884,6 +1896,7 @@ function normalizedFormat(format: ParaFormat | undefined): unknown {
     format.tabStops ? JSON.stringify(format.tabStops) : null,
     format.dropCap ? JSON.stringify(format.dropCap) : null,
     format.autoSpace ?? null,
+    format.emptyRunSizeHalfPoints ?? null,
   ]
 }
 

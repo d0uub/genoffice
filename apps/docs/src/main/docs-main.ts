@@ -10,9 +10,10 @@ import {
 } from 'node:fs'
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises'
 import { basename, join } from 'node:path'
-import { BrowserWindow, Menu, WebContentsView, app, dialog, ipcMain, shell } from 'electron'
+import { BrowserWindow, Menu, WebContentsView, app, dialog, ipcMain, net, shell } from 'electron'
 import {
   appMenuLabels,
+  configuredDefaultSaveDir,
   contextMenuLabels,
   fetchRemoteImage,
   installContextMenu,
@@ -20,8 +21,10 @@ import {
   safeExternalUrl,
   showOpenDialogWithMemory,
   showSaveDialogWithMemory,
+  toggleDevToolsItem,
   windowMenuTemplate,
 } from '@genoffice/electron-utils'
+import { configureMetricsCache, familyVerticalMetrics } from '@genoffice/font-metrics'
 import { createI18n, getUiLang, normalizeLang, setUiLang } from '@genoffice/i18n'
 import { ProjectStore } from '@genoffice/project-store'
 import type {
@@ -38,6 +41,7 @@ import {
   chatForProvider,
   defaultAiSettings,
   resolveAiSettings,
+  setRescueFetch,
   streamForProvider,
   type AiChatRequest,
   type AiSettings,
@@ -1945,14 +1949,14 @@ async function openDialog(event: IpcMainInvokeEvent, options: OpenDialogOptions)
 }
 
 async function saveDialog(event: IpcMainInvokeEvent, options: SaveDialogOptions) {
-  return showSaveDialogWithMemory(dialog, dialogParent(event), options)
+  // before any pick is remembered, bare-name suggestions anchor in the
+  // configurable default save folder instead of Electron's Downloads pin
+  return showSaveDialogWithMemory(dialog, dialogParent(event), options, defaultSaveDir())
 }
 
-/** default folder where new files land on their first (silent) save; shared with the other editors via shell */
+/** default folder where new files land on their first (silent) save; shared with the other editors via shell. User-configurable (app-settings.json), falls back to <Documents>/GenOffice. */
 export function defaultSaveDir(): string {
-  const dir = join(app.getPath('documents'), 'GenOffice')
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return configuredDefaultSaveDir(app)
 }
 
 /** first free path for fileName inside dir: name.ext, name-2.ext, name-3.ext… */
@@ -2850,9 +2854,17 @@ export function registerProjectIpc(): void {
 
 /** document/attachment/window IPC (everything except the AI proxy above) */
 export function registerDocsIpc(): void {
+  // Node fetch (undici) direct connections get reset under VPN/tun setups; retry over Chromium's stack
+  setRescueFetch((url, init) => net.fetch(url, init))
+
   // shared with the other editor modules — last (identical) registration wins
   ipcMain.removeHandler('app:get-language')
   ipcMain.handle('app:get-language', () => getUiLang())
+
+  configureMetricsCache(userDataPath('font-metrics'))
+  ipcMain.handle('docs:font-metrics', (_event, family: string) =>
+    typeof family === 'string' ? familyVerticalMetrics(family) : null,
+  )
 
   ipcMain.handle('docs:open', async (event) => {
     const result = await openDialog(event, {
@@ -3438,7 +3450,7 @@ export function buildDocsMenu(): void {
         },
         { type: 'separator' },
         { role: 'togglefullscreen', label: tm('menuFullscreen') },
-        ...(isDev ? [{ role: 'toggleDevTools' as const }] : []),
+        ...(isDev ? [toggleDevToolsItem(appMenuLabels(getUiLang()))] : []),
       ],
     },
     {

@@ -1,8 +1,14 @@
 import { existsSync } from 'node:fs'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 import { describe, expect, it } from 'vitest'
-import { applyTextEdits, mergeEngineCodepoints, validateTextEdits } from '../src/main/text-edit'
-import type { TextEditInput } from '../src/shared/ipc'
+import {
+  applyTextEdits,
+  applyTextInserts,
+  mergeEngineCodepoints,
+  textInsertAxes,
+  validateTextEdits,
+} from '../src/main/text-edit'
+import type { TextEditInput, TextInsertInput } from '../src/shared/ipc'
 
 /** Happy-path apply: no edit may be skipped */
 async function applyAll(bytes: Uint8Array, edits: TextEditInput[]): Promise<Uint8Array> {
@@ -49,6 +55,48 @@ const edit = (f: Fixture, oldText: string, newText: string): TextEditInput => ({
   oldText,
   newText,
   fontSize: 14,
+})
+
+describe('applyTextInserts', () => {
+  it('counter-rotates text axes for every page rotation', () => {
+    expect(textInsertAxes(0)).toEqual([1, 0, 0, 1])
+    expect(textInsertAxes(90)).toEqual([0, 1, -1, 0])
+    expect(textInsertAxes(180)).toEqual([-1, 0, 0, -1])
+    expect(textInsertAxes(270)).toEqual([0, -1, 1, 0])
+    expect(textInsertAxes(-90)).toEqual([0, -1, 1, 0])
+  })
+
+  it('adds searchable text without replacing existing page content', async () => {
+    const f = await makeFixture('Existing text')
+    const insert: TextInsertInput = {
+      pageIndex: 0,
+      origin: [50, 650],
+      text: 'New searchable text',
+      fontSize: 14,
+      color: [0, 0, 0],
+    }
+    const result = await applyTextInserts(f.bytes, [insert])
+    expect(result.skipped).toEqual([])
+    expect(await extractText(result.bytes)).toContain('Existing text')
+    expect(await extractText(result.bytes)).toContain('New searchable text')
+  })
+
+  it('embeds a subset font for inserted CJK text', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    const f = await makeFixture('Existing text')
+    const result = await applyTextInserts(f.bytes, [
+      {
+        pageIndex: 0,
+        origin: [50, 650],
+        text: '插入中文文本',
+        fontSize: 14,
+        color: [0, 0, 0],
+      },
+    ])
+    expect(result.skipped).toEqual([])
+    expect(await extractText(result.bytes)).toContain('插入中文文本')
+    expect(result.bytes.length).toBeLessThan(200 * 1024)
+  })
 })
 
 describe('applyTextEdits', () => {
@@ -487,8 +535,12 @@ describe('block edits (paragraph rebuild)', () => {
         lineLeading: 18,
       },
     ])
+    // The object-preserving rebuild keeps the original objects side by side on the
+    // merged line; compare per-baseline text so extraction granularity doesn't matter
     const lines = await extractLines(out)
-    expect(lines.map((l) => l.str)).toEqual([
+    const byY = new Map()
+    for (const l of lines) byY.set(l.y, (byY.get(l.y) ?? '') + l.str)
+    expect([...byY.values()].map((s) => s.replace(/\s+/g, ' ').trim())).toEqual([
       'first line of text second line follows',
       'third line ends here',
     ])
@@ -811,5 +863,409 @@ describe('validateTextEdits', () => {
     // No bounds for an edit that does not match
     const [miss] = await validateTextEdits(f.bytes, [edit(f, 'Never was here', 'X')])
     expect(miss!.bounds).toBeUndefined()
+  })
+})
+
+describe('text-first rescue (multi-object lines)', () => {
+  /** Lines whose every word is its own PDF text object on a shared baseline — the
+      granularity Chrome/Word exports use. Word gaps are positional (no space chars
+      inside the objects), so the joined engine text carries no spaces. */
+  async function makeWordLines(
+    lines: { words: string[]; y: number }[],
+  ): Promise<{ bytes: Uint8Array; extents: { left: number; right: number }[] }> {
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([595, 842])
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const size = 14
+    const extents: { left: number; right: number }[] = []
+    for (const { words, y } of lines) {
+      let x = 50
+      let right = 50
+      for (const w of words) {
+        page.drawText(w, { x, y, size, font })
+        right = x + font.widthOfTextAtSize(w, size)
+        x = right + font.widthOfTextAtSize(' ', size)
+      }
+      extents.push({ left: 50, right })
+    }
+    return { bytes: await doc.save({ useObjectStreams: false }), extents }
+  }
+
+  const stripped = (s: string) => s.replace(/\s+/g, '')
+
+  it('rescues a whole-line edit whose rect clips the edge objects', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    const words = ['Use', 'it', 'to', 'cover', 'your', 'entire', 'phone', 'bill']
+    const { bytes, extents } = await makeWordLines([{ words, y: 700 }])
+    const { left, right } = extents[0]!
+    // The rect starts inside 'Use' and ends inside 'bill': the primary path's
+    // ≥50%-containment filter drops both edge objects and the line never matched
+    const rect: [number, number, number, number] = [left + 18, 696, right - 14, 716]
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect,
+        oldText: words.join(' '),
+        newText: 'Use it to pay your whole phone bill',
+        fontSize: 14,
+      },
+    ])
+    expect(stripped(await extractText(out))).toBe('Useittopayyourwholephonebill')
+  })
+
+  it('rescues a style-only recolor with a clipped rect (screenshot scenario)', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    const { chainPdfium, loadPdfium, withDocument } = await import('../src/main/text-edit')
+    const words = ['Use', 'it', 'to', 'cover', 'your', 'phone', 'bill']
+    const { bytes, extents } = await makeWordLines([{ words, y: 700 }])
+    const { left, right } = extents[0]!
+    const oldText = words.join(' ')
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect: [left + 18, 696, right - 12, 716],
+        oldText,
+        newText: oldText,
+        fontSize: 14,
+        newColor: [255, 0, 0],
+      },
+    ])
+    expect(stripped(await extractText(out))).toBe(stripped(oldText))
+    // Every text object on the page is repainted red
+    const m = await loadPdfium()
+    const colors = await chainPdfium(() =>
+      withDocument(m, out, async (doc) => {
+        const page = m._FPDF_LoadPage(doc, 0)
+        const colPtr = m._malloc(16)
+        const found: [number, number, number][] = []
+        try {
+          const count = m._FPDFPage_CountObjects(page)
+          for (let i = 0; i < count; i++) {
+            const obj = m._FPDFPage_GetObject(page, i)
+            if (m._FPDFPageObj_GetType(obj) !== 1) continue
+            m._FPDFPageObj_GetFillColor(obj, colPtr, colPtr + 4, colPtr + 8, colPtr + 12)
+            found.push([m.HEAPU8[colPtr]!, m.HEAPU8[colPtr + 4]!, m.HEAPU8[colPtr + 8]!])
+          }
+          return found
+        } finally {
+          m._free(colPtr)
+          m._FPDF_ClosePage(page)
+        }
+      }),
+    )
+    expect(colors.length).toBeGreaterThan(0)
+    for (const c of colors) expect(c).toEqual([255, 0, 0])
+  })
+
+  it('picks the occurrence nearest the rect when the same text repeats', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    const words = ['Repeated', 'footer', 'line']
+    const { bytes, extents } = await makeWordLines([
+      { words, y: 700 },
+      { words, y: 680 },
+    ])
+    const { left, right } = extents[1]!
+    // Clipped rect around the LOWER copy; the padded candidate set still touches the
+    // upper copy, so the score must pick the right occurrence
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect: [left + 20, 676, right - 8, 696],
+        oldText: words.join(' '),
+        newText: 'Repeated footer EDIT',
+        fontSize: 14,
+      },
+    ])
+    const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+    const doc = await getDocument({ data: out.slice(), useSystemFonts: true }).promise
+    try {
+      const content = await (await doc.getPage(1)).getTextContent()
+      const byLine = new Map<number, string>()
+      for (const i of content.items) {
+        if (!('str' in i) || !i.str.trim()) continue
+        const y = Math.round(i.transform[5]!)
+        byLine.set(y, (byLine.get(y) ?? '') + i.str)
+      }
+      expect(stripped(byLine.get(700) ?? '')).toBe('Repeatedfooterline')
+      expect(stripped(byLine.get(680) ?? '')).toBe('RepeatedfooterEDIT')
+    } finally {
+      await doc.loadingTask.destroy()
+    }
+  })
+
+  it('rescues an edit ending mid-object, keeping the object tail verbatim', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    // Three objects; the edit covers the first two and only 'Plus,' of the third —
+    // like a text-layer line group stopping before the rest of the engine's run
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([595, 842])
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const parts = ['Use it to cover', 'your entire phone.', 'Plus, free shipping']
+    let x = 50
+    const starts: number[] = []
+    for (const p of parts) {
+      starts.push(x)
+      page.drawText(p, { x, y: 700, size: 14, font })
+      x += font.widthOfTextAtSize(`${p} `, 14)
+    }
+    const bytes = await doc.save({ useObjectStreams: false })
+    const rectRight = starts[2]! + font.widthOfTextAtSize('Plus,', 14) + 2
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect: [45, 696, rectRight, 716],
+        oldText: 'Use it to cover your entire phone. Plus,',
+        newText: 'Use it to cover your entire phone. Anyway,',
+        fontSize: 14,
+      },
+    ])
+    expect(stripped(await extractText(out))).toBe('Useittocoveryourentirephone.Anyway,freeshipping')
+  })
+
+  it('fails closed for a paragraph rescue that would end mid-object', async () => {
+    // A block edit (origin/lineLeading set) may only rescue a WHOLE match: apply
+    // strips the layout overrides from fragment matches, which would rebuild the
+    // paragraph at the anchor and pull the edge object's tail into the block run
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([595, 842])
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const parts = ['Use it to cover', 'your entire phone.', 'Plus, free shipping']
+    let x = 50
+    const starts: number[] = []
+    for (const p of parts) {
+      starts.push(x)
+      page.drawText(p, { x, y: 700, size: 14, font })
+      x += font.widthOfTextAtSize(`${p} `, 14)
+    }
+    const bytes = await doc.save({ useObjectStreams: false })
+    const rectRight = starts[2]! + font.widthOfTextAtSize('Plus,', 14) + 2
+    const results = await validateTextEdits(bytes, [
+      {
+        pageIndex: 0,
+        rect: [45, 696, rectRight, 716],
+        oldText: 'Use it to cover your entire phone. Plus,',
+        newText: 'Use it to cover\nyour entire phone. Anyway,',
+        fontSize: 14,
+        origin: [50, 700],
+        lineLeading: 17,
+      },
+    ])
+    expect(results[0]!.reason).toMatch(/could not be located/)
+  })
+
+  it('still reports unlocatable text instead of matching elsewhere', async () => {
+    const { bytes, extents } = await makeWordLines([{ words: ['Only', 'this', 'line'], y: 700 }])
+    const { left, right } = extents[0]!
+    const results = await validateTextEdits(bytes, [
+      {
+        pageIndex: 0,
+        rect: [left, 696, right, 716],
+        oldText: 'Entirely different words',
+        newText: 'X',
+        fontSize: 14,
+      },
+    ])
+    expect(results[0]!.reason).toMatch(/could not be located/)
+  })
+})
+
+describe('whitespace edits (space deletion/insertion between runs)', () => {
+  it('wsEditClamp flags space-adjacent units on both sides of the edit', async () => {
+    const { wsEditClamp } = await import('../src/main/text-edit')
+    // Deleting the space: the 'n' before it and the 'e' after it must be redrawn
+    expect(wsEditClamp('phon e bill', 'phone bill')).toEqual({ headNS: 3, tailNS: 4 })
+    // Inserting a space clamps the same way
+    expect(wsEditClamp('phone bill', 'phon e bill')).toEqual({ headNS: 3, tailNS: 4 })
+    // Glyph-only edits and identical texts don't clamp
+    expect(wsEditClamp('abc def', 'abX def')).toBeNull()
+    expect(wsEditClamp('same text ', 'same text ')).toBeNull()
+    // Reflow: a '\n' replacing a space folds to the same unit — no clamp
+    expect(wsEditClamp('alpha beta', 'alpha\nbeta')).toBeNull()
+  })
+
+  it('keeps suffix objects when a leading space is deleted (headNS -1 stays safe)', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    // Divergence at unit 0: pw = 0 makes headNS -1, which disables prefix keeping
+    // outright. That is required (the unit right of the seam must not be kept via
+    // the prefix, or the deleted space's gap would survive), and it must stay safe:
+    // the tail clamp of the same seam still bounds the suffix at ns(suffix) - 1,
+    // so keepable objects clear of the seam survive instead of a line-wide redraw.
+    expect((await import('../src/main/text-edit')).wsEditClamp(' Use it to', 'Use it to')).toEqual({
+      headNS: -1,
+      tailNS: 6,
+    })
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([595, 842])
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    // First object carries the leading space as a real char; the rest are
+    // word-per-object with positional gaps
+    const parts = [' Use', 'it', 'to']
+    let x = 50
+    for (const p of parts) {
+      page.drawText(p, { x, y: 700, size: 14, font })
+      x += font.widthOfTextAtSize(`${p} `, 14)
+    }
+    const bytes = await doc.save({ useObjectStreams: false })
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect: [40, 694, x + 5, 718],
+        oldText: ' Use it to',
+        newText: 'Use it to',
+        fontSize: 14,
+      },
+    ])
+    expect((await extractText(out)).replace(/\s+/g, '')).toBe('Useitto')
+    // 'to' survives as its own original object via the suffix keep. ('it' is
+    // unkeepable regardless of the clamp: pdfium's text page appends a generated
+    // gap-space to its extracted text, failing the keep plan's chars↔codepoints
+    // guard — the same edit with a glyph change instead of the space keeps
+    // exactly the same set, so the clamp itself flattens nothing.)
+    const { chainPdfium, loadPdfium, withDocument } = await import('../src/main/text-edit')
+    const m = await loadPdfium()
+    const texts = await chainPdfium(() =>
+      withDocument(m, out, async (d) => {
+        const page2 = m._FPDF_LoadPage(d, 0)
+        const textPage = m._FPDFText_LoadPage(page2)
+        const found: string[] = []
+        try {
+          const count = m._FPDFPage_CountObjects(page2)
+          for (let i = 0; i < count; i++) {
+            const obj = m._FPDFPage_GetObject(page2, i)
+            if (m._FPDFPageObj_GetType(obj) !== 1) continue
+            const len = m._FPDFTextObj_GetText(obj, textPage, 0, 0)
+            if (len <= 2) continue
+            const buf = m._malloc(len)
+            m._FPDFTextObj_GetText(obj, textPage, buf, len)
+            found.push(Buffer.from(m.HEAPU8.buffer, buf, len - 2).toString('utf16le'))
+            m._free(buf)
+          }
+          return found
+        } finally {
+          m._FPDFText_ClosePage(textPage)
+          m._FPDF_ClosePage(page2)
+        }
+      }),
+    )
+    expect(texts.map((t) => t.trim())).toContain('to')
+    // No leading space anywhere: the ghost char went with the redrawn neighbor
+    expect(texts.some((t) => t.startsWith(' '))).toBe(false)
+  })
+
+  it('removes a real space char split across two runs (ghost space)', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    // Run 1 carries the space as a real char, run 2 sits past an extra visual gap —
+    // the shape earlier edits leave behind (the tello invoice regression)
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([595, 842])
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    page.drawText('Use phon ', { x: 50, y: 700, size: 14, font })
+    const w1 = font.widthOfTextAtSize('Use phon ', 14)
+    page.drawText('e bill', { x: 50 + w1 + 6, y: 700, size: 14, font })
+    const bytes = await doc.save({ useObjectStreams: false })
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect: [45, 694, 50 + w1 + 6 + font.widthOfTextAtSize('e bill', 14) + 5, 718],
+        oldText: 'Use phon e bill',
+        newText: 'Use phone bill',
+        fontSize: 14,
+      },
+    ])
+    // The deleted space must not survive as a char anywhere in the output
+    expect(await extractText(out)).toBe('Use phone bill')
+  })
+
+  it('closes a positional gap when the synthesized space is deleted', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    // Word-per-object line with positional gaps (no space chars): the renderer
+    // synthesizes the spaces, so deleting one changes no space-free fold unit —
+    // the keep plan used to keep every object at its original spacing (no-op save)
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([595, 842])
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const words = ['Use', 'it', 'to', 'cover', 'phon', 'e', 'bill']
+    const xs: number[] = []
+    let x = 50
+    for (const w of words) {
+      xs.push(x)
+      page.drawText(w, { x, y: 700, size: 14, font })
+      x += font.widthOfTextAtSize(`${w} `, 14)
+    }
+    const bytes = await doc.save({ useObjectStreams: false })
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect: [45, 694, x + 5, 718],
+        oldText: 'Use it to cover phon e bill',
+        newText: 'Use it to cover phone bill',
+        fontSize: 14,
+      },
+    ])
+    expect((await extractText(out)).replace(/\s+/g, '')).toBe('Useittocoverphonebill')
+    const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+    const pdf = await getDocument({ data: out.slice(), useSystemFonts: true }).promise
+    try {
+      const content = await (await pdf.getPage(1)).getTextContent()
+      const items = content.items
+        .filter((i): i is { str: string; transform: number[] } => 'str' in i && !!i.str.trim())
+        .map((i) => ({ str: i.str, x: i.transform[4]! }))
+      // pdf.js synthesizes a space at every visual gap when merging items: the
+      // prefix must read 'cover phone' with no gap inside 'phone' and still be
+      // anchored at the original line start
+      const prefix = items.find((i) => i.str.includes('cover'))!
+      expect(prefix.str).toContain('cover phone')
+      expect(prefix.x).toBeCloseTo(xs[0]!, 1)
+      // 'bill' moves left by about the deleted space width (rebuild-font advances
+      // for the redrawn middle allow some tolerance, but the gap must be gone)
+      const bill = items.find((i) => i.str.startsWith('bill'))!
+      const spaceW = font.widthOfTextAtSize(' ', 14)
+      expect(bill.x).toBeLessThan(xs[6]! - spaceW * 0.5)
+      expect(bill.x).toBeGreaterThan(xs[6]! - spaceW * 2.5)
+    } finally {
+      await pdf.loadingTask.destroy()
+    }
+  })
+
+  it('opens a gap when a space is typed between runs', async () => {
+    if (!existsSync('/System/Library/Fonts/Supplemental/Arial Unicode.ttf')) return
+    const doc = await PDFDocument.create()
+    const page = doc.addPage([595, 842])
+    const font = await doc.embedFont(StandardFonts.Helvetica)
+    const words = ['Fix', 'ph', 'one', 'bill']
+    const xs: number[] = []
+    let x = 50
+    for (const [i, w] of words.entries()) {
+      xs.push(x)
+      page.drawText(w, { x, y: 700, size: 14, font })
+      // 'ph' and 'one' sit tight (one visual word); other words get a space gap
+      x += font.widthOfTextAtSize(w, 14) + (i === 1 ? 0 : font.widthOfTextAtSize(' ', 14))
+    }
+    const bytes = await doc.save({ useObjectStreams: false })
+    const out = await applyAll(bytes, [
+      {
+        pageIndex: 0,
+        rect: [45, 694, x + 5, 718],
+        oldText: 'Fix phone bill',
+        newText: 'Fix ph one bill',
+        fontSize: 14,
+      },
+    ])
+    expect((await extractText(out)).replace(/\s+/g, ' ').trim()).toBe('Fix ph one bill')
+    const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+    const pdf = await getDocument({ data: out.slice(), useSystemFonts: true }).promise
+    try {
+      const content = await (await pdf.getPage(1)).getTextContent()
+      const items = content.items
+        .filter((i): i is { str: string; transform: number[] } => 'str' in i && !!i.str.trim())
+        .map((i) => ({ str: i.str, x: i.transform[4]! }))
+      // 'bill' moves right by roughly the inserted space width
+      const bill = items.find((i) => i.str.startsWith('bill'))!
+      const spaceW = font.widthOfTextAtSize(' ', 14)
+      expect(bill.x).toBeGreaterThan(xs[3]! + spaceW * 0.3)
+      expect(bill.x).toBeLessThan(xs[3]! + spaceW * 2.5)
+    } finally {
+      await pdf.loadingTask.destroy()
+    }
   })
 })
