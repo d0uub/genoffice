@@ -255,6 +255,7 @@ Step E Vary layouts per page (avoid sameness): 3 parallel points→three-column 
 - **generate_deck is the first choice for a whole new deck**: with many pages pass topic+approx_pages+context; the system plans internally (auto-batching over the threshold), **auto-searches images**, writes HTML page by page, and **lands pages onto the canvas as they generate (the user sees them one by one)**. **Neither "only page 1 got generated" nor "arguments were truncated" can happen — the page count is guaranteed by the system loop**.
 - **When adding just 1 page or a few pages (common case)**: also use generate_deck with **pages (briefs for only the new pages) + insert_mode:"append"** (appended at the end, existing pages untouched). **New pages also go through the cloud generation for polish — don't fall back to native tools for a crude page just because it's one page**. Before adding, read_slide/get_deck_context to see the existing pages' style (primary color/layout) and pass a matching style description; write each brief with the real content per region.
 - **Cloud generation fallback**: If cloud generation (Genspark) is unavailable, the system automatically uses local LLM to generate HTML slides. **You don't need to check for sign-in or mention cloud requirements** — just call generate_deck and let the system handle it (cloud if available, local LLM if not).
+- **When generate_deck fails due to cloud unavailability**: Completly redesign existing slide. Re-range layout, colors, and typography to make it look professional
 - Briefs should be concrete: what text/data/numbers go in each region, which image goes where, and the layout name — the cloud designer follows your brief; vague briefs produce generic pages.
 - After generation, if the user wants a tweak, edit the corresponding element with the native tools below; don't redo whole pages unprompted "to look better". Use regenerate_slide only when the user explicitly asks to redo a page.
 
@@ -314,6 +315,14 @@ interface ToolParagraph {
 }
 
 function toEditParagraphs(raw: unknown): EditParagraph[] | null {
+  // Handle JSON string input (AI sometimes sends serialized JSON)
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      return null
+    }
+  }
   if (!Array.isArray(raw) || raw.length === 0) return null
   return raw.map((p) => {
     const para = p as ToolParagraph
@@ -3339,8 +3348,8 @@ async function executeTool(
       const idx = Number(call.input.slideIndex)
       if (!slides[idx])
         return fail(t('aiFailNewElement'), `slideIndex out of range (0-${slides.length - 1})`)
-      const scratchBlock = blockScratchBuild(call.name, slides, state)
-      if (scratchBlock) return scratchBlock
+      // const scratchBlock = blockScratchBuild(call.name, slides, state)
+      // if (scratchBlock) return scratchBlock
       const isShape = call.name === 'add_shape'
       const paragraphs = toEditParagraphs(call.input.paragraphs)
       if (!isShape && !paragraphs)
