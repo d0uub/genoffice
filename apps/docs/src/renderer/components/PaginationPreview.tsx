@@ -8,6 +8,7 @@ import type {
 } from '@genoffice/docx-engine'
 import {
   appendEndnotesBlock,
+  appendFloatSpillBlock,
   assignSections,
   effectiveBottomPx,
   effectiveHfRefs,
@@ -30,6 +31,7 @@ import {
 import { estimateHfHeight, FOOTNOTE_SEPARATOR_H } from '../line-metrics'
 import { toRoman } from '../note-format'
 import { useI18n } from '../i18n/locale'
+import { hfFloatPagePos } from '../editor/hf-dom'
 import { HeaderFooterArea } from './HeaderFooterArea'
 
 const twipsToPx = (twips: number) => (twips / 1440) * 96
@@ -142,7 +144,6 @@ export function PaginationPreview({
   zoom,
   hf,
   watermark,
-  pageColor,
   blockMetaOf,
   pageFootnotesOf,
   endnoteItems,
@@ -150,6 +151,7 @@ export function PaginationPreview({
   clearPageGaps,
   onExportPdf,
   onClose,
+  suppressEscape,
 }: {
   /** Canvas geometry (final section): for the measurement origin / clone width */
   section: SectionSettings
@@ -162,7 +164,6 @@ export function PaginationPreview({
   zoom: number
   hf: HfSet
   watermark: string | null
-  pageColor: string | null
   /** docxIndex → parse-layer pagination constraints (keepNext/widow/table-row flags) */
   blockMetaOf?: BlockMetaOf
   /** Per-page footnote collection (referencing page → entry list), for page-bottom rendering */
@@ -181,6 +182,8 @@ export function PaginationPreview({
   clearPageGaps?: () => void
   onExportPdf: () => void
   onClose: () => void
+  /** While true (e.g. the print dialog is stacked on top), Escape must not close the preview */
+  suppressEscape?: boolean
 }) {
   const { t } = useI18n()
   const [slices, setSlices] = useState<PageSlice[]>([])
@@ -214,7 +217,7 @@ export function PaginationPreview({
     if (colFlow) pm.classList.add('measuring-columns')
     try {
       const origin = pm.getBoundingClientRect().top + canvasMTop * factor
-      const { blocks, totalHeight } = measureBlocks(pm, origin, factor)
+      const { blocks, totalHeight, floats } = measureBlocks(pm, origin, factor)
       const live = liveSections(sections, blocks)
       setSecs(live)
       if (live.length > 0) assignSections(blocks, live)
@@ -224,7 +227,13 @@ export function PaginationPreview({
         endnoteItems ?? [],
         FOOTNOTE_SEPARATOR_H,
       )
-      const flowH = withEndnotes?.totalHeight ?? totalHeight
+      // floating boxes below the flow end still need pages to land on
+      const flowWithFloats = appendFloatSpillBlock(
+        blocks,
+        withEndnotes?.totalHeight ?? totalHeight,
+        floats,
+      )
+      const flowH = flowWithFloats ?? withEndnotes?.totalHeight ?? totalHeight
       setEndnotesTop(withEndnotes?.top ?? null)
       let computed: PageSlice[]
       if (live.length > 0) {
@@ -288,7 +297,7 @@ export function PaginationPreview({
         let gapAccum = 0
         for (const el of kidEls) {
           const rect = el.getBoundingClientRect()
-          if (el.classList.contains('page-gap')) {
+          if (el.classList.contains('page-gap') || el.classList.contains('page-float-host')) {
             gapAccum += rect.height
             continue
           }
@@ -322,6 +331,10 @@ export function PaginationPreview({
   }, [])
 
   useEffect(() => {
+    // stopPropagation cannot shield this window-level listener from the print
+    // dialog's own Escape handler (same target, same phase), so the dialog
+    // suppresses it via prop while it is stacked on top
+    if (suppressEscape) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.stopPropagation()
@@ -330,7 +343,7 @@ export function PaginationPreview({
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  }, [onClose, suppressEscape])
 
   const multiSection = secs.length > 1
   const effRefs = useMemo(() => effectiveHfRefs(secs), [secs])
@@ -421,7 +434,7 @@ export function PaginationPreview({
         <span className="pv-title">{t('appPaginationPreview')}</span>
         <span className="pv-count">{t('appTotalPagesN', { n: slices.length })}</span>
         <span className="pv-hint">{t('appPvHint')}</span>
-        <button className="pv-close" title={t('appPvExportTip')} onClick={onExportPdf}>
+        <button className="pv-close" data-tip={t('appPvExportTip')} onClick={onExportPdf}>
           {t('appExportPdf')}
         </button>
         <button className="pv-close" onClick={onClose}>
@@ -460,12 +473,12 @@ export function PaginationPreview({
                   '--pv-page-h': `${pageH}px`,
                   '--page-w': `${pageW}px`,
                   '--page-h': `${pageH}px`,
+                  '--section-content-w': `${secContentW}px`,
                   '--header-dist': `${pageBox.headerDist}px`,
                   '--footer-dist': `${pageBox.footerDist}px`,
                   '--pv-mr': `${twipsToPx(s.marginRight)}px`,
                   '--pv-ml': `${twipsToPx(s.marginLeft)}px`,
                   padding: `${mTop}px ${twipsToPx(s.marginRight)}px ${mBottom}px ${twipsToPx(s.marginLeft)}px`,
-                  background: pageColor ? `#${pageColor}` : undefined,
                 } as React.CSSProperties
               }
             >
@@ -476,32 +489,35 @@ export function PaginationPreview({
               )}
               {(parts.headerImages ?? [])
                 .filter((img) => img.floating)
-                .map((img, k) => (
-                  // picture watermark (absolute VML shape in the header): drawn once
+                .map((img, k) => {
+                  // picture watermark (anchored image in the header): drawn once
                   // per page behind the body (negative z-index; .pv-page isolates)
-                  <img
-                    key={`wm${k}`}
-                    className="pv-watermark-img"
-                    src={img.dataUrl}
-                    alt=""
-                    aria-hidden="true"
-                    style={{
-                      left:
-                        img.posH === 'center'
-                          ? '50%'
-                          : img.posH === 'right'
-                            ? undefined
-                            : twipsToPx(s.marginLeft),
-                      right: img.posH === 'right' ? twipsToPx(s.marginRight) : undefined,
-                      top: img.posV === 'center' ? '50%' : img.posV === 'bottom' ? undefined : mTop,
-                      bottom: img.posV === 'bottom' ? mBottom : undefined,
-                      transform: `translate(${img.posH === 'center' ? '-50%' : '0'}, ${img.posV === 'center' ? '-50%' : '0'})`,
-                      ...(img.widthPx ? { width: img.widthPx } : {}),
-                      ...(img.heightPx ? { height: img.heightPx } : {}),
-                      ...(img.washout ? { filter: 'brightness(1.6) contrast(0.35)' } : {}),
-                    }}
-                  />
-                ))}
+                  const pos = hfFloatPagePos(img, {
+                    pageW,
+                    pageH,
+                    marginLeft: twipsToPx(s.marginLeft),
+                    marginRight: twipsToPx(s.marginRight),
+                    marginTop: mTop,
+                    marginBottom: mBottom,
+                  })
+                  return (
+                    <img
+                      key={`wm${k}`}
+                      className="pv-watermark-img"
+                      src={img.dataUrl}
+                      alt=""
+                      aria-hidden="true"
+                      style={{
+                        left: pos.x,
+                        top: pos.y,
+                        transform: `translate(${pos.translateX}%, ${pos.translateY}%)`,
+                        ...(img.widthPx ? { width: img.widthPx } : {}),
+                        ...(img.heightPx ? { height: img.heightPx } : {}),
+                        ...(img.washout ? { filter: 'brightness(1.6) contrast(0.35)' } : {}),
+                      }}
+                    />
+                  )
+                })}
               {parts.header && (
                 <HeaderFooterArea
                   kind="header"
@@ -680,6 +696,9 @@ export function PaginationPreview({
                                     fontSize: run.sizeHalfPoints
                                       ? `${run.sizeHalfPoints / 2}pt`
                                       : undefined,
+                                    textTransform: run.caps === 'all' ? 'uppercase' : undefined,
+                                    fontVariantCaps:
+                                      run.caps === 'small' ? 'small-caps' : undefined,
                                   }}
                                 >
                                   {run.text}
@@ -729,6 +748,9 @@ export function PaginationPreview({
                                       fontSize: run.sizeHalfPoints
                                         ? `${run.sizeHalfPoints / 2}pt`
                                         : undefined,
+                                      textTransform: run.caps === 'all' ? 'uppercase' : undefined,
+                                      fontVariantCaps:
+                                        run.caps === 'small' ? 'small-caps' : undefined,
                                     }}
                                   >
                                     {run.text}

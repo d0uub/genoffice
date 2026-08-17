@@ -133,6 +133,7 @@ export type MenuCommand =
   | 'print'
   | 'export-pdf'
   | 'word-count'
+  | 'ai-proofread'
 
 export type UiTheme = 'light' | 'dark' | 'system'
 
@@ -149,6 +150,9 @@ export interface DesktopApi {
   getTheme(): Promise<UiTheme>
   /** theme switched from the shell home page */
   onThemeChanged(handler: (theme: UiTheme) => void): () => void
+  /** press on the shell chrome (tab strip is a sibling WebContentsView whose
+   *  clicks produce no DOM event here) — dismiss open popovers */
+  onChromePressed(handler: () => void): () => void
   openDocx(): Promise<OpenFileResult | null>
   openDocxPath(path: string): Promise<OpenFileResult | null>
   /** mark the renderer ready and consume a file passed by Finder/Explorer at launch */
@@ -186,8 +190,8 @@ export interface DesktopApi {
   fontMetrics(family: string): Promise<FaceVerticalMetrics | null>
   getAiSettings(): Promise<AiSettings>
   setAiSettings(settings: AiSettings): Promise<void>
-  /** system print dialog for the current window */
-  print(): Promise<void>
+  /** system print dialog for the current window; ok=false without error = canceled */
+  print(): Promise<{ ok: boolean; error?: string }>
   /** render the document to PDF and ask where to save; size in twips.
    *  outPath is only honored when a previous export dialog chose that exact path */
   exportPdf(

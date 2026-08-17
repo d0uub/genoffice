@@ -38,6 +38,7 @@ import { parseFileToText } from '@genoffice/file-parse'
 import {
   AiCreditsError,
   AiTimeoutError,
+  isAiNetworkError,
   chatForProvider,
   defaultAiSettings,
   resolveAiSettings,
@@ -170,8 +171,7 @@ const tMain = createI18n({
     menuParagraph: '段落…',
     menuTools: '工具',
     menuWordCount: '字数统计…',
-    menuSpelling: '拼写和语法检查',
-    menuMacros: '宏',
+    menuAiProofread: 'AI 校对',
     menuWindow: '窗口',
     menuHelp: '帮助',
     menuDocsHelp: 'GenOffice Docs 帮助',
@@ -264,8 +264,7 @@ const tMain = createI18n({
     menuParagraph: 'Paragraph…',
     menuTools: 'Tools',
     menuWordCount: 'Word Count…',
-    menuSpelling: 'Spelling and Grammar',
-    menuMacros: 'Macros',
+    menuAiProofread: 'AI Proofread',
     menuWindow: 'Window',
     menuHelp: 'Help',
     menuDocsHelp: 'GenOffice Docs Help',
@@ -358,8 +357,7 @@ const tMain = createI18n({
     menuParagraph: '段落…',
     menuTools: 'ツール',
     menuWordCount: '文字カウント…',
-    menuSpelling: 'スペルチェックと文章校正',
-    menuMacros: 'マクロ',
+    menuAiProofread: 'AI 校正',
     menuWindow: 'ウィンドウ',
     menuHelp: 'ヘルプ',
     menuDocsHelp: 'GenOffice Docs ヘルプ',
@@ -453,8 +451,7 @@ const tMain = createI18n({
     menuParagraph: '단락…',
     menuTools: '도구',
     menuWordCount: '단어 개수…',
-    menuSpelling: '맞춤법 및 문법 검사',
-    menuMacros: '매크로',
+    menuAiProofread: 'AI 교정',
     menuWindow: '창',
     menuHelp: '도움말',
     menuDocsHelp: 'GenOffice Docs 도움말',
@@ -549,8 +546,7 @@ const tMain = createI18n({
     menuParagraph: 'Paragraphe…',
     menuTools: 'Outils',
     menuWordCount: 'Statistiques…',
-    menuSpelling: 'Grammaire et orthographe',
-    menuMacros: 'Macros',
+    menuAiProofread: 'Relecture IA',
     menuWindow: 'Fenêtre',
     menuHelp: 'Aide',
     menuDocsHelp: 'Aide GenOffice Docs',
@@ -645,8 +641,7 @@ const tMain = createI18n({
     menuParagraph: 'Absatz…',
     menuTools: 'Extras',
     menuWordCount: 'Wörter zählen…',
-    menuSpelling: 'Rechtschreibung und Grammatik',
-    menuMacros: 'Makros',
+    menuAiProofread: 'KI-Korrektur',
     menuWindow: 'Fenster',
     menuHelp: 'Hilfe',
     menuDocsHelp: 'GenOffice Docs-Hilfe',
@@ -740,8 +735,7 @@ const tMain = createI18n({
     menuParagraph: 'Párrafo…',
     menuTools: 'Herramientas',
     menuWordCount: 'Contar palabras…',
-    menuSpelling: 'Ortografía y gramática',
-    menuMacros: 'Macros',
+    menuAiProofread: 'Corrección con IA',
     menuWindow: 'Ventana',
     menuHelp: 'Ayuda',
     menuDocsHelp: 'Ayuda de GenOffice Docs',
@@ -834,8 +828,7 @@ const tMain = createI18n({
     menuParagraph: 'ย่อหน้า…',
     menuTools: 'เครื่องมือ',
     menuWordCount: 'นับจำนวนคำ…',
-    menuSpelling: 'การสะกดและไวยากรณ์',
-    menuMacros: 'แมโคร',
+    menuAiProofread: 'พิสูจน์อักษรด้วย AI',
     menuWindow: 'หน้าต่าง',
     menuHelp: 'วิธีใช้',
     menuDocsHelp: 'วิธีใช้ GenOffice Docs',
@@ -928,8 +921,7 @@ const tMain = createI18n({
     menuParagraph: 'Paragraf…',
     menuTools: 'Alat',
     menuWordCount: 'Hitungan Kata…',
-    menuSpelling: 'Ejaan dan Tata Bahasa',
-    menuMacros: 'Makro',
+    menuAiProofread: 'Koreksi AI',
     menuWindow: 'Jendela',
     menuHelp: 'Bantuan',
     menuDocsHelp: 'Bantuan GenOffice Docs',
@@ -1023,8 +1015,7 @@ const tMain = createI18n({
     menuParagraph: 'Абзац…',
     menuTools: 'Сервис',
     menuWordCount: 'Статистика…',
-    menuSpelling: 'Правописание',
-    menuMacros: 'Макросы',
+    menuAiProofread: 'ИИ-корректура',
     menuWindow: 'Окно',
     menuHelp: 'Справка',
     menuDocsHelp: 'Справка GenOffice Docs',
@@ -1118,8 +1109,7 @@ const tMain = createI18n({
     menuParagraph: 'فقرة…',
     menuTools: 'أدوات',
     menuWordCount: 'عدد الكلمات…',
-    menuSpelling: 'تدقيق إملائي ونحوي',
-    menuMacros: 'وحدات الماكرو',
+    menuAiProofread: 'تدقيق بالذكاء الاصطناعي',
     menuWindow: 'نافذة',
     menuHelp: 'تعليمات',
     menuDocsHelp: 'تعليمات GenOffice Docs',
@@ -1213,8 +1203,7 @@ const tMain = createI18n({
     menuParagraph: 'Parágrafo…',
     menuTools: 'Ferramentas',
     menuWordCount: 'Contagem de Palavras…',
-    menuSpelling: 'Ortografia e Gramática',
-    menuMacros: 'Macros',
+    menuAiProofread: 'Revisão com IA',
     menuWindow: 'Janela',
     menuHelp: 'Ajuda',
     menuDocsHelp: 'Ajuda do GenOffice Docs',
@@ -1308,8 +1297,7 @@ const tMain = createI18n({
     menuParagraph: 'Paragrafo…',
     menuTools: 'Strumenti',
     menuWordCount: 'Conteggio parole…',
-    menuSpelling: 'Ortografia e grammatica',
-    menuMacros: 'Macro',
+    menuAiProofread: 'Correzione IA',
     menuWindow: 'Finestra',
     menuHelp: 'Aiuto',
     menuDocsHelp: 'Guida di GenOffice Docs',
@@ -1403,8 +1391,7 @@ const tMain = createI18n({
     menuParagraph: 'Akapit…',
     menuTools: 'Narzędzia',
     menuWordCount: 'Statystyka wyrazów…',
-    menuSpelling: 'Pisownia i gramatyka',
-    menuMacros: 'Makra',
+    menuAiProofread: 'Korekta AI',
     menuWindow: 'Okno',
     menuHelp: 'Pomoc',
     menuDocsHelp: 'Pomoc GenOffice Docs',
@@ -1498,8 +1485,7 @@ const tMain = createI18n({
     menuParagraph: 'Alinea…',
     menuTools: 'Extra',
     menuWordCount: 'Woorden tellen…',
-    menuSpelling: 'Spelling en grammatica',
-    menuMacros: "Macro's",
+    menuAiProofread: 'AI-proeflezen',
     menuWindow: 'Venster',
     menuHelp: 'Help',
     menuDocsHelp: 'GenOffice Docs Help',
@@ -1593,8 +1579,7 @@ const tMain = createI18n({
     menuParagraph: 'Perenggan…',
     menuTools: 'Alat',
     menuWordCount: 'Kiraan Perkataan…',
-    menuSpelling: 'Ejaan dan Tatabahasa',
-    menuMacros: 'Makro',
+    menuAiProofread: 'Pembacaan Pruf AI',
     menuWindow: 'Tetingkap',
     menuHelp: 'Bantuan',
     menuDocsHelp: 'Bantuan GenOffice Docs',
@@ -1686,8 +1671,7 @@ const tMain = createI18n({
     menuParagraph: 'פסקה…',
     menuTools: 'כלים',
     menuWordCount: 'ספירת מילים…',
-    menuSpelling: 'איות ודקדוק',
-    menuMacros: 'פקודות מאקרו',
+    menuAiProofread: 'הגהת AI',
     menuWindow: 'חלון',
     menuHelp: 'עזרה',
     menuDocsHelp: 'עזרה של GenOffice Docs',
@@ -1781,8 +1765,7 @@ const tMain = createI18n({
     menuParagraph: 'अनुच्छेद…',
     menuTools: 'उपकरण',
     menuWordCount: 'शब्द गणना…',
-    menuSpelling: 'वर्तनी और व्याकरण',
-    menuMacros: 'मैक्रो',
+    menuAiProofread: 'AI प्रूफ़रीडिंग',
     menuWindow: 'विंडो',
     menuHelp: 'सहायता',
     menuDocsHelp: 'GenOffice Docs सहायता',
@@ -1873,8 +1856,7 @@ const tMain = createI18n({
     menuParagraph: '段落…',
     menuTools: '工具',
     menuWordCount: '字數統計…',
-    menuSpelling: '拼字及文法檢查',
-    menuMacros: '巨集',
+    menuAiProofread: 'AI 校對',
     menuWindow: '視窗',
     menuHelp: '說明',
     menuDocsHelp: 'GenOffice Docs 說明',
@@ -2569,7 +2551,9 @@ export function registerAiIpc(): void {
             ? { errorCode: 'timeout' as const }
             : err instanceof AiCreditsError
               ? { errorCode: 'credits' as const }
-              : {}),
+              : isAiNetworkError(err)
+                ? { errorCode: 'network' as const }
+                : {}),
         })
       }
     } finally {
@@ -3121,9 +3105,18 @@ export function registerDocsIpc(): void {
     },
   )
 
-  ipcMain.handle('docs:print', (event) => {
-    // print the calling tab's own content; zero margins — the docx page padding provides them
-    event.sender.print({ margins: { marginType: 'none' } })
+  ipcMain.handle('docs:print', async (event) => {
+    // print the calling tab's own content; zero margins — the docx page padding provides them.
+    // Resolves when the system dialog is dismissed; the print dialog stays open on cancel
+    // (ok=false without error) and surfaces real failures.
+    return new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      event.sender.print({ margins: { marginType: 'none' } }, (success, failureReason) => {
+        resolve({
+          ok: success,
+          ...(failureReason && !/cancel/i.test(failureReason) ? { error: failureReason } : {}),
+        })
+      })
+    })
   })
 
   ipcMain.handle(
@@ -3385,7 +3378,9 @@ export function buildDocsMenu(): void {
         {
           label: tm('menuPrint'),
           accelerator: 'CmdOrCtrl+P',
-          click: () => activeDocsWebContents()?.print({}),
+          // routed through the renderer: it opens the pagination preview first so each
+          // printed sheet is exactly one editor page (WYSIWYG), then invokes docs:print
+          click: () => sendCommand('print'),
         },
       ],
     },
@@ -3508,8 +3503,8 @@ export function buildDocsMenu(): void {
       submenu: [
         { label: tm('menuWordCount'), click: () => sendCommand('word-count') },
         { type: 'separator' },
-        { label: tm('menuSpelling'), enabled: false },
-        { label: tm('menuMacros'), enabled: false },
+        // Runs the same AI proofread as Review > Editor (renderer shows the one-time ack)
+        { label: tm('menuAiProofread'), click: () => sendCommand('ai-proofread') },
       ],
     },
     windowMenuTemplate(process.platform, appMenuLabels(getUiLang())),
@@ -3823,7 +3818,10 @@ export function startDocsStandalone(): void {
   // dev runs must not share the packaged app's userData (recent files, AI settings)
   // or its single-instance lock — otherwise `npm run dev` silently quits whenever
   // the installed GenOffice Docs is open and forwards its argv there instead.
-  if (isDev) app.setPath('userData', join(app.getPath('appData'), 'GenOffice Docs Dev'))
+  // AI_OFFICE_USER_DATA: E2E/screenshot runs isolate userData (and the
+  // single-instance lock) so parallel automation sessions don't evict each other
+  if (process.env.AI_OFFICE_USER_DATA) app.setPath('userData', process.env.AI_OFFICE_USER_DATA)
+  else if (isDev) app.setPath('userData', join(app.getPath('appData'), 'GenOffice Docs Dev'))
 
   const hasSingleInstanceLock = app.requestSingleInstanceLock()
   if (!hasSingleInstanceLock) {

@@ -27,13 +27,39 @@ export function resolveFill(
         stops: fill.stops.map((s) => ({ pos: s.pos, color: s.color })),
         angleDeg: fill.angle != null ? fill.angle / 60000 : 0,
         ...(fill.path ? { radial: true } : {}),
+        ...(fill.path && fill.fillTo
+          ? {
+              center: {
+                x: (fill.fillTo.l + (1 - fill.fillTo.r)) / 2,
+                y: (fill.fillTo.t + (1 - fill.fillTo.b)) / 2,
+              },
+            }
+          : {}),
       }
-    case 'image':
+    case 'image': {
+      // Tile natural size: image pixels are 96dpi units; vp.scale is the 96dpi-px multiplier
+      const pxPerImagePx = vp.scale
       return {
         kind: 'image',
         dataUrl: media?.(fill.mediaRef),
         mode: fill.mode ?? 'stretch',
+        ...(fill.alpha != null ? { alpha: fill.alpha } : {}),
+        ...(fill.fillRect ? { fillRect: fill.fillRect } : {}),
+        ...(fill.duotone ? { duotone: fill.duotone } : {}),
+        ...(fill.clrChange ? { clrChange: fill.clrChange } : {}),
+        ...(fill.tile
+          ? {
+              tile: {
+                scaleX: pxPerImagePx * fill.tile.sx,
+                scaleY: pxPerImagePx * fill.tile.sy,
+                txPx: emuToPx(fill.tile.tx, vp.scale),
+                tyPx: emuToPx(fill.tile.ty, vp.scale),
+                algn: fill.tile.algn,
+              },
+            }
+          : {}),
       }
+    }
     case 'pattern':
       // Pattern fills are approximated with the foreground color for now (Phase 2 skips 8x8 tile replication)
       return { kind: 'solid', color: fill.fg }

@@ -21,6 +21,10 @@ import type {
 import {
   featheredImage,
   fillToKonva,
+  processedImage,
+  processedImageKey,
+  flatColorImage,
+  isDegenerateImage,
   strokeToKonva,
   shadowToKonva,
   cropToKonva,
@@ -28,6 +32,8 @@ import {
   shapeGlyphs,
   layoutGlyphs,
   normalizeColor,
+  boxPivotProps,
+  centerFillProps,
 } from './konva-adapter'
 import { ChartBody } from './ChartBody'
 import { needsTextFrameHitArea } from './text-hit-area'
@@ -67,22 +73,32 @@ export const NodeBody = React.memo(function NodeBody({
 
   if (node.type === 'picture') {
     const pic = node as PictureRenderNode
-    const img = pic.dataUrl ? images.get(pic.dataUrl) : undefined
+    const rawImg = pic.dataUrl ? images.get(pic.dataUrl) : undefined
+    // clrChange/duotone recolor the pixels; the derived key keeps processed variants out of raw cache slots
+    const srcKey = processedImageKey(pic.dataUrl ?? '', pic.clrChange, pic.duotone)
+    const procImg =
+      rawImg && (pic.clrChange || pic.duotone)
+        ? (processedImage(
+            rawImg,
+            pic.dataUrl ?? '',
+            pic.clrChange,
+            pic.duotone,
+          ) as HTMLImageElement)
+        : rawImg
+    // ≤2×2 pictures stretch to one flat color in PowerPoint (crop is meaningless there)
+    const tiny = !!procImg && isDegenerateImage(procImg)
+    const img = procImg && tiny ? (flatColorImage(procImg, srcKey) as HTMLImageElement) : procImg
     const clip = pic.clip
     const image = img ? (
       <KImage
         image={
           pic.softEdgePx && img.width
-            ? featheredImage(
-                img,
-                pic.dataUrl ?? '',
-                pic.softEdgePx * (img.width / Math.max(box.w, 1)),
-              )
+            ? featheredImage(img, srcKey, pic.softEdgePx * (img.width / Math.max(box.w, 1)))
             : img
         }
         width={box.w}
         height={box.h}
-        {...cropToKonva(pic, img)}
+        {...(tiny ? {} : cropToKonva(pic, img))}
         {...(pic.opacity != null ? { opacity: pic.opacity } : {})}
         {...(clip ? {} : { ...strokeToKonva(pic.stroke), ...shadowToKonva(pic.shadow, pic.glow) })}
       />
@@ -124,6 +140,10 @@ export const NodeBody = React.memo(function NodeBody({
               ctx.closePath()
             }}
           >
+            {/* spPr fill: PowerPoint always paints it behind the image, even a translucent one */}
+            {pic.fill && outline({ ...fillToKonva(pic.fill, box.w, box.h, images) })}
+            {/* Backdrop only for fully opaque previews: with partial opacity the two alphas would stack */}
+            {pic.bgColor && (pic.opacity ?? 1) >= 1 && outline({ fill: pic.bgColor })}
             {image}
           </Group>
           {'stroke' in strokeProps && outline({ ...strokeProps, fillEnabled: false })}
@@ -133,6 +153,14 @@ export const NodeBody = React.memo(function NodeBody({
     }
     return (
       <>
+        {/* spPr fill: PowerPoint always paints it behind the image, even a translucent one */}
+        {pic.fill && (
+          <Rect width={box.w} height={box.h} {...fillToKonva(pic.fill, box.w, box.h, images)} />
+        )}
+        {/* Backdrop only for fully opaque previews: with partial opacity the two alphas would stack */}
+        {pic.bgColor && img && (pic.opacity ?? 1) >= 1 && (
+          <Rect width={box.w} height={box.h} fill={pic.bgColor} />
+        )}
         {image}
         {pic.media && <MediaBadge kind={pic.media} w={box.w} h={box.h} />}
       </>
@@ -141,71 +169,108 @@ export const NodeBody = React.memo(function NodeBody({
 
   if (node.type === 'table') {
     const table = node as TableRenderNode
+    const tblW = table.gridX[table.gridX.length - 1] ?? node.box.w
+    const tblH = table.gridY[table.gridY.length - 1] ?? node.box.h
     return (
       <>
-        {table.cells.map((cell, i) => (
-          <React.Fragment key={i}>
-            <Rect
-              x={cell.x}
-              y={cell.y}
-              width={cell.w}
-              height={cell.h}
-              {...fillToKonva(cell.fill, cell.w, cell.h, images)}
-            />
-            {cell.borders?.t && (
-              <Line
-                points={[cell.x, cell.y, cell.x + cell.w, cell.y]}
-                {...strokeToKonva(cell.borders.t)}
-              />
-            )}
-            {cell.borders?.b && (
-              <Line
-                points={[cell.x, cell.y + cell.h, cell.x + cell.w, cell.y + cell.h]}
-                {...strokeToKonva(cell.borders.b)}
-              />
-            )}
-            {cell.borders?.l && (
-              <Line
-                points={[cell.x, cell.y, cell.x, cell.y + cell.h]}
-                {...strokeToKonva(cell.borders.l)}
-              />
-            )}
-            {cell.borders?.r && (
-              <Line
-                points={[cell.x + cell.w, cell.y, cell.x + cell.w, cell.y + cell.h]}
-                {...strokeToKonva(cell.borders.r)}
-              />
-            )}
-            {(hideCellText && cell.row === hideCellText.row && cell.col === hideCellText.col
+        {table.bgFill && (
+          <Rect
+            x={0}
+            y={0}
+            width={tblW}
+            height={tblH}
+            {...fillToKonva(table.bgFill, tblW, tblH, images)}
+          />
+        )}
+        {table.cells.map((cell, i) => {
+          const cellGlyphs =
+            hideCellText && cell.row === hideCellText.row && cell.col === hideCellText.col
               ? []
               : layoutGlyphs(cell.text)
-            ).map((g, j) => (
-              <Text
-                key={j}
-                x={cell.x + (cell.text?.insets.l ?? 0) + g.x}
-                y={cell.y + (cell.text?.insets.t ?? 0) + g.y}
-                text={g.text}
-                fontSize={g.fontSize}
-                fontFamily={g.fontFamily}
-                fontStyle={g.fontStyle}
-                textDecoration={g.textDecoration}
-                rotation={g.rotation ?? 0}
-                letterSpacing={g.letterSpacing ?? 0}
-                fill={g.fill}
-                direction={g.direction ?? 'inherit'}
-                {...(g.stroke
-                  ? { stroke: g.stroke, strokeWidth: g.strokeWidth, fillAfterStrokeEnabled: true }
-                  : {})}
+          return (
+            <React.Fragment key={i}>
+              <Rect
+                x={cell.x}
+                y={cell.y}
+                width={cell.w}
+                height={cell.h}
+                {...fillToKonva(cell.fill, cell.w, cell.h, images)}
               />
-            ))}
-          </React.Fragment>
-        ))}
+              {cell.borders?.t && (
+                <Line
+                  points={[cell.x, cell.y, cell.x + cell.w, cell.y]}
+                  {...strokeToKonva(cell.borders.t)}
+                />
+              )}
+              {cell.borders?.b && (
+                <Line
+                  points={[cell.x, cell.y + cell.h, cell.x + cell.w, cell.y + cell.h]}
+                  {...strokeToKonva(cell.borders.b)}
+                />
+              )}
+              {cell.borders?.l && (
+                <Line
+                  points={[cell.x, cell.y, cell.x, cell.y + cell.h]}
+                  {...strokeToKonva(cell.borders.l)}
+                />
+              )}
+              {cell.borders?.r && (
+                <Line
+                  points={[cell.x + cell.w, cell.y, cell.x + cell.w, cell.y + cell.h]}
+                  {...strokeToKonva(cell.borders.r)}
+                />
+              )}
+              {/* Highlight backgrounds first, so a run's highlight never covers a neighbor's glyphs */}
+              {cellGlyphs.map(
+                (g, j) =>
+                  g.highlight && (
+                    <Rect
+                      key={`hl${j}`}
+                      x={cell.x + (cell.text?.insets.l ?? 0) + g.highlight.x}
+                      y={cell.y + (cell.text?.insets.t ?? 0) + g.highlight.y}
+                      width={g.highlight.w}
+                      height={g.highlight.h}
+                      fill={g.highlight.color}
+                      listening={false}
+                    />
+                  ),
+              )}
+              {cellGlyphs.map((g, j) => (
+                <Text
+                  key={j}
+                  x={cell.x + (cell.text?.insets.l ?? 0) + g.x}
+                  y={cell.y + (cell.text?.insets.t ?? 0) + g.y}
+                  text={g.text}
+                  fontSize={g.fontSize}
+                  fontFamily={g.fontFamily}
+                  fontStyle={g.fontStyle}
+                  textDecoration={g.textDecoration}
+                  rotation={g.rotation ?? 0}
+                  letterSpacing={g.letterSpacing ?? 0}
+                  fill={g.fill}
+                  direction={g.direction ?? 'inherit'}
+                  {...(g.stroke
+                    ? { stroke: g.stroke, strokeWidth: g.strokeWidth, fillAfterStrokeEnabled: true }
+                    : {})}
+                  {...(g.shadowEnabled
+                    ? {
+                        shadowColor: g.shadowColor,
+                        shadowBlur: g.shadowBlur,
+                        shadowOffsetX: g.shadowOffsetX,
+                        shadowOffsetY: g.shadowOffsetY,
+                      }
+                    : {})}
+                />
+              ))}
+            </React.Fragment>
+          )
+        })}
       </>
     )
   }
 
   if (node.type === 'chart') {
-    return <ChartBody chart={node as ChartRenderNode} />
+    return <ChartBody chart={node as ChartRenderNode} images={images} />
   }
 
   if (node.type === 'placeholder-chip') {
@@ -374,7 +439,7 @@ export const NodeBody = React.memo(function NodeBody({
         y={box.h / 2}
         radiusX={box.w / 2}
         radiusY={box.h / 2}
-        {...fillProps}
+        {...centerFillProps(fillProps, box.w, box.h)}
         {...strokeProps}
         {...shadowProps}
       />
@@ -394,13 +459,69 @@ export const NodeBody = React.memo(function NodeBody({
     )
   }
 
+  // fillOverlay: PowerPoint blends the overlay against the shape's own fill in isolation.
+  // Approximation: an opaque white underlay + base fill + overlay with multiply — where the
+  // base fill is absent/translucent the multiply hits white (= plain overlay color) instead
+  // of bleeding in whatever lies under the shape.
+  let overlayUnder: React.ReactNode = null
+  let overlayGeom: React.ReactNode = null
+  if (shape.fillOverlay) {
+    const oProps = fillToKonva(shape.fillOverlay, box.w, box.h, images)
+    const sameGeom = (props: Record<string, unknown>): React.ReactNode => {
+      const common = { listening: false, ...props }
+      if (shape.fillPathData || shape.pathData)
+        return <Path data={(shape.fillPathData ?? shape.pathData)!} {...common} />
+      if (shape.polygonPoints) return <Line points={shape.polygonPoints} closed {...common} />
+      if (presetToShapeKind(shape.presetGeometry) === 'ellipse')
+        return (
+          <Ellipse
+            x={box.w / 2}
+            y={box.h / 2}
+            radiusX={box.w / 2}
+            radiusY={box.h / 2}
+            {...common}
+          />
+        )
+      return (
+        <Rect width={box.w} height={box.h} cornerRadius={shape.cornerRadiusPx ?? 0} {...common} />
+      )
+    }
+    overlayUnder = sameGeom({ fill: '#ffffff' })
+    const isEllipse =
+      !shape.fillPathData &&
+      !shape.pathData &&
+      !shape.polygonPoints &&
+      presetToShapeKind(shape.presetGeometry) === 'ellipse'
+    overlayGeom = sameGeom({
+      ...(isEllipse ? centerFillProps(oProps, box.w, box.h) : oProps),
+      globalCompositeOperation: 'multiply' as const,
+    })
+  }
+
   return (
     <>
       {/* Text is drawn as individual glyph runs, so line spacing and insets otherwise
           have no hit area. Cover every text-bearing shape (including round/custom
           geometry) so clicks inside its text frame cannot reach a picture underneath. */}
       {needsTextFrameHitArea(shape) && <Rect width={box.w} height={box.h} fill="transparent" />}
+      {overlayUnder}
       {geom}
+      {overlayGeom}
+      {/* Text highlight backgrounds: all rects first so a run's highlight never covers a neighbor's glyphs */}
+      {glyphs.map(
+        (g, i) =>
+          g.highlight && (
+            <Rect
+              key={`hl${i}`}
+              x={(shape.text?.insets.l ?? 0) + g.highlight.x}
+              y={(shape.text?.insets.t ?? 0) + g.highlight.y}
+              width={g.highlight.w}
+              height={g.highlight.h}
+              fill={g.highlight.color}
+              listening={false}
+            />
+          ),
+      )}
       {glyphs.map((g, i) => (
         <Text
           key={i}
@@ -417,6 +538,14 @@ export const NodeBody = React.memo(function NodeBody({
           direction={g.direction ?? 'inherit'}
           {...(g.stroke
             ? { stroke: g.stroke, strokeWidth: g.strokeWidth, fillAfterStrokeEnabled: true }
+            : {})}
+          {...(g.shadowEnabled
+            ? {
+                shadowColor: g.shadowColor,
+                shadowBlur: g.shadowBlur,
+                shadowOffsetX: g.shadowOffsetX,
+                shadowOffsetY: g.shadowOffsetY,
+              }
             : {})}
         />
       ))}
@@ -571,20 +700,12 @@ function MediaBadge({ kind, w, h }: { kind: 'video' | 'audio'; w: number; h: num
 
 /**
  * Statically positioned node: container (position/rotation/flip) + NodeBody.
- * Flip is corrected with an offset (x + w then scale -1) so it mirrors inside the original box
- * instead of outside it.
+ * Rotation and flip pivot on the box center (boxPivotProps), matching OOXML.
  */
 export const StaticNode = React.memo(function StaticNode({ node, images }: NodeBodyProps) {
   const { box } = node
   return (
-    <Group
-      x={box.x + (box.flipH ? box.w : 0)}
-      y={box.y + (box.flipV ? box.h : 0)}
-      rotation={box.rotationDeg}
-      scaleX={box.flipH ? -1 : 1}
-      scaleY={box.flipV ? -1 : 1}
-      listening={false}
-    >
+    <Group {...boxPivotProps(box)} listening={false}>
       <NodeBody node={node} images={images} />
     </Group>
   )

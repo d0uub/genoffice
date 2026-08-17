@@ -338,12 +338,24 @@ export interface EditStrokeOp {
   groupId?: string
 }
 
-/** Solid page background; slideIndex=-1 applies to all pages. */
-export interface EditBackgroundOp {
+/**
+ * Page background edit; slideIndex=-1 applies to all pages.
+ * - solid/gradient: explicit fill
+ * - image: pick=true opens the system picker; pick=false reuses the current
+ *   image background of sourceSlideIndex (e.g. "apply to all" after picking)
+ * - reset: drop the slide's own <p:bg> (falls back to layout/master)
+ * - hideGraphics: toggle <p:sld showMasterSp> (hide master/layout decorations)
+ */
+export type EditBackgroundOp = {
   slideIndex: number
-  color: string
   fitWidthPx: number
-}
+} & (
+  | { kind: 'solid'; color: string }
+  | { kind: 'gradient'; from: string; to: string; angleDeg?: number; radial?: boolean }
+  | { kind: 'image'; mode: 'stretch' | 'tile'; pick?: boolean; sourceSlideIndex?: number }
+  | { kind: 'reset' }
+  | { kind: 'hideGraphics'; hidden: boolean }
+)
 
 /** Copy the selected elements to the in-app clipboard (any type, including tables/charts/groups). */
 export interface CopyElementsOp {
@@ -761,12 +773,14 @@ export interface AddChartOp {
   /** 'barH' = horizontal bar (mapped to kind 'bar' + barDir 'bar' in the main process) */
   kind:
     | 'bar'
+    | 'bar3D'
     | 'barStacked'
     | 'barPercentStacked'
     | 'barH'
     | 'line'
     | 'area'
     | 'pie'
+    | 'pie3D'
     | 'doughnut'
     | 'scatter'
     | 'radar'
@@ -877,12 +891,14 @@ export interface EditChartOp {
   /** Change chart type (rebuilds the chart part); undefined = unchanged; 'barH' = horizontal bar */
   kind?:
     | 'bar'
+    | 'bar3D'
     | 'barStacked'
     | 'barPercentStacked'
     | 'barH'
     | 'line'
     | 'area'
     | 'pie'
+    | 'pie3D'
     | 'doughnut'
     | 'scatter'
     | 'radar'
@@ -953,6 +969,10 @@ export interface PrintSlidesOp {
   layout?: 'full' | 'handout2' | 'handout3' | 'handout6' | 'notes'
   /** Per-page notes text for the notes layout (same order as pngsBase64) */
   notes?: string[]
+  /** Paper orientation for handout/notes pages (full pages always follow the slide ratio) */
+  orientation?: 'portrait' | 'landscape'
+  /** Border around full-page slides */
+  frame?: boolean
 }
 
 /** Show sync state from presenter view -> audience window (absolute state mirror; audience seek is idempotent) */
@@ -1012,8 +1032,21 @@ export interface SlidesApi {
   getTheme: () => Promise<UiTheme>
   /** theme switched from the shell home page */
   onThemeChanged: (handler: (theme: UiTheme) => void) => () => void
+  /** press on the shell chrome (tab strip is a sibling WebContentsView whose
+   *  clicks produce no DOM event here) — dismiss open popovers */
+  onChromePressed: (handler: () => void) => () => void
+  /** snap the host window in/out of instant fullscreen for the slideshow
+   *  (macOS simpleFullScreen — skips the animated Space transition) */
+  setShowFullScreen: (on: boolean) => Promise<void>
   openPptx: (fitWidthPx: number) => Promise<OpenResult | null>
   openPptxPath: (path: string, fitWidthPx: number) => Promise<OpenResult | null>
+  /** Office-private faces referenced by layouts so far; the renderer registers them as FontFaces
+   *  (files invisible to Chromium — DFonts/cloud fonts), so drawing uses the measuring font. */
+  privateFontFaces: () => Promise<
+    Array<{ id: string; family: string; bold: boolean; italic: boolean }>
+  >
+  /** Single-face sfnt bytes for one private face (null = gone/unreadable) */
+  privateFontData: (id: string) => Promise<ArrayBuffer | null>
   consumePendingOpen: (fitWidthPx: number) => Promise<OpenResult | null>
   /** New blank presentation (single blank 16:9 page, untitled) */
   newBlank: (fitWidthPx: number) => Promise<OpenResult>

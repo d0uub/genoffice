@@ -324,11 +324,14 @@ export const RprChangeMark = Mark.create({
   },
 })
 
-/** Generic inline field (DATE/TIME/NUMPAGES/FILENAME…): text is the cached result, recomputed on F9 */
+/** Generic inline field (DATE/TIME/NUMPAGES/FILENAME…): text is the cached result, recomputed on F9.
+ * inclusive: false — typing at the field edge must produce plain text, not extend the field */
 export const InstrFieldMark = Mark.create({
   name: 'instrField',
+  inclusive: false,
   addAttributes() {
-    return { instr: { default: '' } }
+    // beginXml: preserved w:fldChar begin run (form-field ffData) for verbatim write-back
+    return { instr: { default: '' }, beginXml: { default: null } }
   },
   parseHTML() {
     return [{ tag: 'span[data-instr-field]' }]
@@ -436,6 +439,11 @@ export const TextStyleMark = Mark.create({
       vertAlign: { default: null as 'superscript' | 'subscript' | null },
       // East Asian emphasis mark (w:em val); saving is kept faithful by rawRPr
       em: { default: null as string | null },
+      // w:caps ('all') / w:smallCaps ('small'); saving is kept faithful by rawRPr
+      caps: { default: null as 'all' | 'small' | null },
+      // rtl run (w:rtl, explicit or style-inherited): save-side decode selects the Cs twins.
+      // Position must match runMarks' attr order (mark attrs are JSON-compared in signatures)
+      cs: { default: null as boolean | null, rendered: false },
       styleId: { default: null as string | null },
       // raw rPr slice pass-through (not rendered; on save mergeRPrModel preserves unmodeled attributes)
       rawRPr: { default: null as string | null, rendered: false },
@@ -494,6 +502,8 @@ export const TextStyleMark = Mark.create({
       const pos = em === 'comma' || em === 'circle' ? 'over' : 'under'
       styles.push(`text-emphasis:${shape}`, `text-emphasis-position:${pos} right`)
     }
+    if (mark.attrs.caps === 'all') styles.push('text-transform:uppercase')
+    else if (mark.attrs.caps === 'small') styles.push('font-variant-caps:small-caps')
     const attrs: Record<string, string> = { 'data-doc-style': '1', style: styles.join(';') }
     if (mark.attrs.styleId) attrs['data-style'] = String(mark.attrs.styleId)
     return ['span', attrs, 0]

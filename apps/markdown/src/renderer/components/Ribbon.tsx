@@ -2,12 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Editor } from '@tiptap/core'
 import { useEditorState } from '@tiptap/react'
+import { useDismissablePopover } from '@genoffice/ui'
 import { useI18n } from '../i18n/locale'
 import type { StringKey } from '../i18n/locale'
 import { GensparkMark } from '../ai/AiPanel'
 import { liftFromList } from '../editor/slashCommand'
 import {
   IconBullets,
+  IconCaret,
   IconHr,
   IconInlineCode,
   IconLink,
@@ -159,6 +161,7 @@ export function Ribbon({
   const [linkOpen, setLinkOpen] = useState(false)
   const [linkUrl, setLinkUrl] = useState('')
   const linkInputRef = useRef<HTMLInputElement>(null)
+  const linkAnchorRef = useRef<HTMLSpanElement>(null)
 
   const state = useEditorState({
     editor,
@@ -191,6 +194,10 @@ export function Ribbon({
   useEffect(() => {
     if (linkOpen) linkInputRef.current?.focus()
   }, [linkOpen])
+
+  useDismissablePopover(linkOpen, () => setLinkOpen(false), {
+    inside: () => [linkAnchorRef.current],
+  })
 
   const off = disabled || !editor || !state
 
@@ -308,18 +315,23 @@ export function Ribbon({
 
         <div className="ribbon-group">
           <div className="ribbon-group-items">
-            <select
-              className="rb-style"
-              value={state?.style ?? 'paragraph'}
-              disabled={off}
-              onChange={(e) => editor && applyBlockStyle(editor, e.target.value as BlockStyle)}
-            >
-              {(Object.keys(STYLE_LABEL) as BlockStyle[]).map((s) => (
-                <option key={s} value={s}>
-                  {t(STYLE_LABEL[s])}
-                </option>
-              ))}
-            </select>
+            <span className="rb-style-wrap">
+              <select
+                className="rb-style"
+                value={state?.style ?? 'paragraph'}
+                disabled={off}
+                onChange={(e) => editor && applyBlockStyle(editor, e.target.value as BlockStyle)}
+              >
+                {(Object.keys(STYLE_LABEL) as BlockStyle[]).map((s) => (
+                  <option key={s} value={s}>
+                    {t(STYLE_LABEL[s])}
+                  </option>
+                ))}
+              </select>
+              <span className="rb-style-caret">
+                <IconCaret />
+              </span>
+            </span>
           </div>
         </div>
 
@@ -359,7 +371,7 @@ export function Ribbon({
             >
               <IconInlineCode size={ICON} />
             </IconBtn>
-            <span className="rb-link-anchor">
+            <span className="rb-link-anchor" ref={linkAnchorRef}>
               <IconBtn title={t('link')} active={state?.link} disabled={off} onClick={openLink}>
                 <IconLink size={ICON} />
               </IconBtn>
@@ -371,11 +383,11 @@ export function Ribbon({
                     placeholder={t('linkPlaceholder')}
                     onChange={(e) => setLinkUrl(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter') applyLink()
+                      if (e.key === 'Enter' && linkUrl.trim()) applyLink()
                       if (e.key === 'Escape') setLinkOpen(false)
                     }}
                   />
-                  <button type="button" onClick={applyLink}>
+                  <button type="button" disabled={!linkUrl.trim()} onClick={applyLink}>
                     {t('linkApply')}
                   </button>
                 </span>

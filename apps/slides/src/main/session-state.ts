@@ -15,6 +15,7 @@ import {
 } from '@genoffice/pptx-render'
 import { createSystemFontMetrics } from './fonts'
 import { tiffToPng } from './tiff-decode'
+import { neutralizeJpegOrientation } from './jpeg-orientation'
 
 export interface RuntimePaths {
   preloadPath: string
@@ -233,6 +234,17 @@ export function setSlidesShellWindow(win: BrowserWindow | null): void {
   windowRefs.shellWindow = win
 }
 
+/** Shell-registered hook (aggregate/tab mode only): cover the tab strip with a tab's
+ *  view during a slideshow without going through HTML fullscreen. Standalone slides
+ *  windows have no tab strip and leave this null. */
+export const showChrome = {
+  setBleed: null as ((wc: WebContents, on: boolean) => void) | null,
+}
+
+export function setSlidesShowBleed(cb: (wc: WebContents, on: boolean) => void): void {
+  showChrome.setBleed = cb
+}
+
 export function setActiveSlidesWebContents(wc: WebContents | null): void {
   windowRefs.activeWebContents = wc
 }
@@ -269,6 +281,9 @@ const DISPLAY_MIME: Record<string, string> = {
   bmp: 'image/bmp',
   webp: 'image/webp',
   svg: 'image/svg+xml',
+  // Metafiles keep their real mime so the renderer's image loader rasterizes them
+  emf: 'image/x-emf',
+  wmf: 'image/x-wmf',
 }
 
 /** Image mediaRef -> dataUrl (lazily decoded). TIFF is transcoded to PNG for display
@@ -286,7 +301,10 @@ export function makeMediaResolver(opened: OpenedPptx) {
         if (decoded) url = `data:image/png;base64,${Buffer.from(decoded.png).toString('base64')}`
       } else {
         const mime = DISPLAY_MIME[ext] ?? 'image/png'
-        url = `data:${mime};base64,${Buffer.from(bytes).toString('base64')}`
+        // PowerPoint ignores EXIF orientation; Chromium applies it on decode — neutralize
+        // the flag so rotated-pixel JPEGs with a shape-level rot don't double-rotate
+        const served = mime === 'image/jpeg' ? neutralizeJpegOrientation(bytes) : bytes
+        url = `data:${mime};base64,${Buffer.from(served).toString('base64')}`
       }
     }
     cache.set(mediaRef, url)
